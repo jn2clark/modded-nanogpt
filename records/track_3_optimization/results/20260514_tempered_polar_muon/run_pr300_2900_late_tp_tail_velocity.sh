@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Clean reproduction runner for the exact-2900 PR300 + late Tempered Polar +
+# tail-velocity candidate. By default this runs the first 16 seeds sequentially.
+# Override SEEDS to replay a shorter fixed list, e.g. SEEDS="0 1 2 3 4 5 6".
+
+SEEDS="${SEEDS:-0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15}"
+BASE_MASTER_PORT="${BASE_MASTER_PORT:-29600}"
+RUNNER="records/track_3_optimization/results/20260514_tempered_polar_muon/run_pr300_2900_radial_xewa_candidate.sh"
+
+for seed in $SEEDS; do
+  port=$((BASE_MASTER_PORT + seed))
+  echo "Running seed ${seed} on port ${port}"
+  SEED="$seed" \
+  MASTER_PORT="$port" \
+  TRAIN_STEPS="${TRAIN_STEPS:-2900}" \
+  SCHEDULE_STEPS="${SCHEDULE_STEPS:-3020}" \
+  CONTRA_TO_NORMAL_END_STEP="${CONTRA_TO_NORMAL_END_STEP:-2750}" \
+  TEMPERED_POLAR_RHO="${TEMPERED_POLAR_RHO:-0.05}" \
+  TEMPERED_POLAR_MAX_DELTA="${TEMPERED_POLAR_MAX_DELTA:-0.25}" \
+  TEMPERED_POLAR_RAMP_START_STEP="${TEMPERED_POLAR_RAMP_START_STEP:-2600}" \
+  TEMPERED_POLAR_RAMP_END_STEP="${TEMPERED_POLAR_RAMP_END_STEP:-2800}" \
+  RADIAL_OUTWARD_SCALE="${RADIAL_OUTWARD_SCALE:-0.5}" \
+  RADIAL_OUTWARD_SCALE_LATE="${RADIAL_OUTWARD_SCALE_LATE:-0.4}" \
+  RADIAL_DECAY_START_STEP="${RADIAL_DECAY_START_STEP:-2400}" \
+  RADIAL_DECAY_END_STEP="${RADIAL_DECAY_END_STEP:-2900}" \
+  TAIL_EMA_START_STEP="${TAIL_EMA_START_STEP:-0}" \
+  TAIL_EMA_GAMMA="${TAIL_EMA_GAMMA:-0.0}" \
+  TAIL_VEL_START_STEP="${TAIL_VEL_START_STEP:-2500}" \
+  TAIL_VEL_BETA="${TAIL_VEL_BETA:-0.90}" \
+  TAIL_VEL_GAMMA="${TAIL_VEL_GAMMA:--6.0}" \
+  TAIL_VEL_MAX_DELTA_RATIO="${TAIL_VEL_MAX_DELTA_RATIO:-0.01}" \
+  TAIL_VEL_EVAL_GAMMAS="${TAIL_VEL_EVAL_GAMMAS:-}" \
+  "$RUNNER"
+done
