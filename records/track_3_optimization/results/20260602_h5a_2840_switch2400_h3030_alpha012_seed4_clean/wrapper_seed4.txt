@@ -1,0 +1,38 @@
+=== seed 4 clean full run ===
+records/track_3_optimization/results/20260602_h5a_2840_switch2400_h3030_alpha012_seed4_clean/70108047-563f-4fe3-9db6-d768b7c5ec3e.txt
+step:125/2840 val_loss:4.47918 train_time:209.649s step_avg:1677.19ms
+step:250/2840 val_loss:4.10365 train_time:416.322s step_avg:1665.29ms
+step:375/2840 val_loss:3.94809 train_time:623.382s step_avg:1662.35ms
+broad_delta[0] captured step:500 apply_step:1000 gamma:-0.005 tensors:172
+step:500/2840 val_loss:3.82246 train_time:830.007s step_avg:1660.01ms
+step:625/2840 val_loss:3.76335 train_time:1037.618s step_avg:1660.19ms
+step:750/2840 val_loss:3.71677 train_time:1244.668s step_avg:1659.56ms
+step:875/2840 val_loss:3.67770 train_time:1452.665s step_avg:1660.19ms
+broad_delta[0] step:1000 gamma:-0.005 delta_norm:1454.100342 moved_norm:7.270502 clipped:0
+broad_delta[0]_groups adam:count=100 delta_norm=373.950653 moved_norm=1.869753 max_move_rel=0.00597271 max_tensor=blocks.0.norm1.gains | ov:count=24 delta_norm=663.237976 moved_norm=3.316190 max_move_rel=0.00437681 max_tensor=blocks.0.attn.v.weight | muon_other:count=48 delta_norm=1238.823486 moved_norm=6.194117 max_move_rel=0.00455472 max_tensor=blocks.5.attn.q.weight
+step:1000/2840 val_loss:3.63823 train_time:1659.742s step_avg:1659.74ms
+step:1125/2840 val_loss:3.61553 train_time:1867.727s step_avg:1660.20ms
+step:1250/2840 val_loss:3.58271 train_time:2075.015s step_avg:1660.01ms
+step:1375/2840 val_loss:3.55759 train_time:2282.668s step_avg:1660.12ms
+step:1500/2840 val_loss:3.52334 train_time:2489.664s step_avg:1659.78ms
+step:1625/2840 val_loss:3.50103 train_time:2697.205s step_avg:1659.82ms
+step:1750/2840 val_loss:3.46863 train_time:2904.349s step_avg:1659.63ms
+step:1875/2840 val_loss:3.43945 train_time:3111.860s step_avg:1659.66ms
+broad_delta[1] captured step:2000 apply_step:2400 gamma:-0.005 tensors:172
+step:2000/2840 val_loss:3.40472 train_time:3318.841s step_avg:1659.42ms
+step:2125/2840 val_loss:3.37973 train_time:3526.412s step_avg:1659.49ms
+step:2250/2840 val_loss:3.35649 train_time:3733.447s step_avg:1659.31ms
+step:2375/2840 val_loss:3.33629 train_time:3941.079s step_avg:1659.40ms
+broad_delta[1] step:2400 gamma:-0.005 delta_norm:922.034058 moved_norm:4.610170 clipped:0
+broad_delta[1]_groups adam:count=100 delta_norm=146.293457 moved_norm=0.731467 max_move_rel=0.000753123 max_tensor=proj.weight | ov:count=24 delta_norm=429.618927 moved_norm=2.148095 max_move_rel=0.00134815 max_tensor=blocks.0.attn.v.weight | muon_other:count=48 delta_norm=802.603577 moved_norm=4.013018 max_move_rel=0.00156797 max_tensor=blocks.11.attn.q.weight
+final_readout captured step:2400 tensors:172
+step:2500/2840 val_loss:3.32302 train_time:4148.067s step_avg:1659.23ms
+step:2625/2840 val_loss:3.30569 train_time:4356.063s step_avg:1659.45ms
+trail_delta captured step:2640
+trail_delta step:2740 gamma:-0.04 delta_norm:196.974945 moved_norm:7.878998 clipped:0 adam_damped:0 muon_damped:0 lookahead_touched:0
+trail_delta_groups adam:count=100 delta_norm=32.196594 moved_norm=1.287864 max_move_rel=0.00175465 max_tensor=blocks.0.norm1.gains | ov:count=24 delta_norm=96.132881 moved_norm=3.845315 max_move_rel=0.00232911 max_tensor=blocks.11.attn.proj.weight | muon_other:count=48 delta_norm=168.881546 moved_norm=6.755261 max_move_rel=0.00243505 max_tensor=blocks.11.attn.q.weight
+step:2750/2840 val_loss:3.28938 train_time:4563.359s step_avg:1659.40ms
+trail_delta step:2840 gamma:-0.12 delta_norm:225.384964 moved_norm:27.046194 clipped:0 adam_damped:0 muon_damped:0 lookahead_touched:0
+trail_delta_groups adam:count=100 delta_norm=40.394268 moved_norm=4.847312 max_move_rel=0.00496191 max_tensor=blocks.0.norm1.gains | ov:count=24 delta_norm=109.068352 moved_norm=13.088202 max_move_rel=0.00795693 max_tensor=blocks.11.attn.proj.weight | muon_other:count=48 delta_norm=193.056427 moved_norm=23.166773 max_move_rel=0.00847447 max_tensor=blocks.11.attn.q.weight
+final_readout applied step:2840 anchor_step:2400 alpha:0.12 delta_norm:515.202209 moved_norm:61.824265 clipped:0
+step:2840/2840 val_loss:3.27774 train_time:4712.719s step_avg:1659.41ms

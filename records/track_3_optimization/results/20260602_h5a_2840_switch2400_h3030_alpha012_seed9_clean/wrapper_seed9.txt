@@ -1,0 +1,38 @@
+=== seed 9 clean full run ===
+records/track_3_optimization/results/20260602_h5a_2840_switch2400_h3030_alpha012_seed9_clean/a71adcc1-0a6f-4a00-a600-a43f06c059cb.txt
+step:125/2840 val_loss:4.48850 train_time:208.235s step_avg:1665.88ms
+step:250/2840 val_loss:4.10393 train_time:413.228s step_avg:1652.91ms
+step:375/2840 val_loss:3.95315 train_time:618.666s step_avg:1649.78ms
+broad_delta[0] captured step:500 apply_step:1000 gamma:-0.005 tensors:172
+step:500/2840 val_loss:3.82210 train_time:823.697s step_avg:1647.39ms
+step:625/2840 val_loss:3.76199 train_time:1029.366s step_avg:1646.99ms
+step:750/2840 val_loss:3.71570 train_time:1234.512s step_avg:1646.02ms
+step:875/2840 val_loss:3.67780 train_time:1440.222s step_avg:1645.97ms
+broad_delta[0] step:1000 gamma:-0.005 delta_norm:1457.197510 moved_norm:7.285987 clipped:0
+broad_delta[0]_groups adam:count=100 delta_norm=374.117157 moved_norm=1.870586 max_move_rel=0.00542404 max_tensor=blocks.0.norm1.gains | ov:count=24 delta_norm=665.122742 moved_norm=3.325614 max_move_rel=0.00427546 max_tensor=blocks.0.attn.v.weight | muon_other:count=48 delta_norm=1241.399414 moved_norm=6.206997 max_move_rel=0.00456712 max_tensor=blocks.4.attn.q.weight
+step:1000/2840 val_loss:3.63896 train_time:1645.546s step_avg:1645.55ms
+step:1125/2840 val_loss:3.61225 train_time:1851.456s step_avg:1645.74ms
+step:1250/2840 val_loss:3.58147 train_time:2056.951s step_avg:1645.56ms
+step:1375/2840 val_loss:3.55497 train_time:2262.596s step_avg:1645.52ms
+step:1500/2840 val_loss:3.52533 train_time:2467.808s step_avg:1645.21ms
+step:1625/2840 val_loss:3.50136 train_time:2673.502s step_avg:1645.23ms
+step:1750/2840 val_loss:3.46948 train_time:2878.653s step_avg:1644.94ms
+step:1875/2840 val_loss:3.44058 train_time:3084.081s step_avg:1644.84ms
+broad_delta[1] captured step:2000 apply_step:2400 gamma:-0.005 tensors:172
+step:2000/2840 val_loss:3.40579 train_time:3288.812s step_avg:1644.41ms
+step:2125/2840 val_loss:3.38029 train_time:3493.747s step_avg:1644.12ms
+step:2250/2840 val_loss:3.35700 train_time:3697.767s step_avg:1643.45ms
+step:2375/2840 val_loss:3.33673 train_time:3902.540s step_avg:1643.17ms
+broad_delta[1] step:2400 gamma:-0.005 delta_norm:923.205872 moved_norm:4.616030 clipped:0
+broad_delta[1]_groups adam:count=100 delta_norm=147.028259 moved_norm=0.735141 max_move_rel=0.000753707 max_tensor=proj.weight | ov:count=24 delta_norm=428.611145 moved_norm=2.143056 max_move_rel=0.00132606 max_tensor=blocks.11.attn.proj.weight | muon_other:count=48 delta_norm=804.353394 moved_norm=4.021767 max_move_rel=0.00157731 max_tensor=blocks.11.attn.q.weight
+final_readout captured step:2400 tensors:172
+step:2500/2840 val_loss:3.32330 train_time:4107.341s step_avg:1642.94ms
+step:2625/2840 val_loss:3.30617 train_time:4312.658s step_avg:1642.92ms
+trail_delta captured step:2640
+trail_delta step:2740 gamma:-0.04 delta_norm:196.771561 moved_norm:7.870863 clipped:0 adam_damped:0 muon_damped:0 lookahead_touched:0
+trail_delta_groups adam:count=100 delta_norm=32.323246 moved_norm=1.292930 max_move_rel=0.00166145 max_tensor=blocks.0.norm1.gains | ov:count=24 delta_norm=95.262428 moved_norm=3.810497 max_move_rel=0.00233347 max_tensor=blocks.11.attn.proj.weight | muon_other:count=48 delta_norm=169.113358 moved_norm=6.764534 max_move_rel=0.00243805 max_tensor=blocks.11.attn.q.weight
+step:2750/2840 val_loss:3.29000 train_time:4517.253s step_avg:1642.64ms
+trail_delta step:2840 gamma:-0.12 delta_norm:225.283569 moved_norm:27.034019 clipped:0 adam_damped:0 muon_damped:0 lookahead_touched:0
+trail_delta_groups adam:count=100 delta_norm=40.744160 moved_norm=4.889299 max_move_rel=0.00511925 max_tensor=blocks.10.mlp.proj.bias | ov:count=24 delta_norm=108.219170 moved_norm=12.986300 max_move_rel=0.00796995 max_tensor=blocks.11.attn.proj.weight | muon_other:count=48 delta_norm=193.342148 moved_norm=23.201056 max_move_rel=0.00848074 max_tensor=blocks.11.attn.q.weight
+final_readout applied step:2840 anchor_step:2400 alpha:0.12 delta_norm:515.644592 moved_norm:61.877350 clipped:0
+step:2840/2840 val_loss:3.27845 train_time:4665.048s step_avg:1642.62ms
