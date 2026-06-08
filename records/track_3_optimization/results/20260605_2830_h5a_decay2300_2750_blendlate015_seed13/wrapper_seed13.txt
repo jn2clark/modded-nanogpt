@@ -1,0 +1,20 @@
+records/track_3_optimization/results/20260605_2830_h5a_decay2300_2750_blendlate015_seed13/c807728c-4a95-4721-bf40-253b7f3a02f4.txt
+broad_delta[0] captured step:500 apply_step:1000 gamma:-0.005 tensors:172
+step:500/2830 train_time:839.378s step_avg:1678.76ms
+broad_delta[0] step:1000 gamma:-0.005 delta_norm:1455.309448 moved_norm:7.276548 clipped:0
+broad_delta[0]_groups adam:count=100 delta_norm=373.760895 moved_norm=1.868804 max_move_rel=0.00532395 max_tensor=blocks.0.norm1.gains | ov:count=24 delta_norm=665.594421 moved_norm=3.327972 max_move_rel=0.00430517 max_tensor=blocks.1.attn.v.weight | muon_other:count=48 delta_norm=1239.036865 moved_norm=6.195184 max_move_rel=0.00458665 max_tensor=blocks.11.attn.q.weight
+step:1000/2830 train_time:1675.519s step_avg:1675.52ms
+step:1500/2830 train_time:2514.197s step_avg:1676.13ms
+broad_delta[1] captured step:2000 apply_step:2400 gamma:-0.005 tensors:172
+step:2000/2830 train_time:3352.206s step_avg:1676.10ms
+broad_delta[1] step:2400 gamma:-0.005 delta_norm:924.008545 moved_norm:4.620044 clipped:0
+broad_delta[1]_groups adam:count=100 delta_norm=146.506973 moved_norm=0.732535 max_move_rel=0.000756605 max_tensor=proj.weight | ov:count=24 delta_norm=434.922760 moved_norm=2.174614 max_move_rel=0.0013736 max_tensor=blocks.11.attn.proj.weight | muon_other:count=48 delta_norm=801.978821 moved_norm=4.009894 max_move_rel=0.00159108 max_tensor=blocks.11.attn.q.weight
+final_readout captured step:2400 tensors:172
+step:2500/2830 train_time:4189.761s step_avg:1675.90ms
+trail_delta captured step:2630
+trail_delta step:2730 gamma:-0.04 delta_norm:216.889511 moved_norm:8.675580 clipped:0 adam_damped:0 muon_damped:0 lookahead_touched:0
+trail_delta_groups adam:count=100 delta_norm=35.288353 moved_norm=1.411534 max_move_rel=0.00166144 max_tensor=blocks.0.norm1.gains | ov:count=24 delta_norm=106.295792 moved_norm=4.251832 max_move_rel=0.00261489 max_tensor=blocks.11.attn.proj.weight | muon_other:count=48 delta_norm=185.733612 moved_norm=7.429344 max_move_rel=0.00269891 max_tensor=blocks.11.attn.q.weight
+trail_delta step:2830 gamma:-0.12 delta_norm:202.414597 moved_norm:24.289749 clipped:0 adam_damped:0 muon_damped:0 lookahead_touched:0
+trail_delta_groups adam:count=100 delta_norm=37.719517 moved_norm=4.526342 max_move_rel=0.00464053 max_tensor=blocks.10.mlp.proj.bias | ov:count=24 delta_norm=98.226234 moved_norm=11.787148 max_move_rel=0.00729546 max_tensor=blocks.11.attn.proj.weight | muon_other:count=48 delta_norm=172.917633 moved_norm=20.750114 max_move_rel=0.00766738 max_tensor=blocks.11.attn.q.weight
+final_readout applied step:2830 anchor_step:2400 alpha:0.14 delta_norm:537.412842 moved_norm:75.237793 clipped:0
+step:2830/2830 val_loss:3.27726 train_time:4740.912s step_avg:1675.23ms

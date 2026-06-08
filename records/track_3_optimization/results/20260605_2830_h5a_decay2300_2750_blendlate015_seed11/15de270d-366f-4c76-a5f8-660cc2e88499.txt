@@ -1,0 +1,3376 @@
+"""
+train_gpt_circuit_muon.py
+
+This file descends from the [NanoGPT speedrun](https://github.com/KellerJordan/modded-nanogpt).
+Built directly on top of PR #309 (OscarYau525, EMA-Nesterov + Aurora @ 2890),
+then adds PR311 Circuit-Muon on the attention V <-> attn.proj pair and the
+2850-step two-pulse TrailDelta Momentum tail controller. Circuit-Muon applies
+per-head partner-scalar post-whitening + trace-only gauge rebalance inside a
+coupled pass that replaces the per-param round-robin for V and O. All other
+PR309 machinery (EMA-Nesterov, Aurora polar, Contra/Soft-Muon, SOAP for MLP+V,
+NorMuon-lite, radial scale, u/w-floor, rescale-to-radius) is unchanged.
+
+PR309 itself incorporates:
+  @nilin    PR275 (Contra-Muon), PR291 (Contra-to-Soft interpolation)
+  @kumarkrishna PR274 / Skylight-001 (NorMuon-lite + u/w-floor + lr=0.0375)
+  @samacqua PR278 (SOAP preconditioning on MLP, extended here to V)
+  @yash-oai PR287 (PowerCool power-law LR schedule)
+"""
+
+import os
+import sys
+with open(sys.argv[0]) as f:
+    code = f.read() # read the code of this file ASAP, for logging
+import argparse
+import uuid
+import time
+from pathlib import Path
+
+import torch
+from torch import Tensor, nn
+from torch.optim import AdamW
+import torch.nn.functional as F
+import torch.distributed as dist
+
+
+# cuDNN SDPA can fail to build an execution plan for this compiled causal-attention
+# layout on some PyTorch/CUDA/cuDNN combinations. Leave Flash/mem-efficient/math SDPA
+# enabled and only remove the cuDNN backend from consideration.
+torch.backends.cuda.enable_cudnn_sdp(False)
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--seed", type=int, default=0)
+args = parser.parse_args()
+
+
+SEED = args.seed
+# 2850 TrailDelta Momentum candidate defaults. Override via environment for probes.
+FINAL_TRAIN_STEPS = int(os.environ.get("TRAIN_STEPS", "2850"))
+FINAL_SCHEDULE_STEPS = int(os.environ.get("SCHEDULE_STEPS", "2950"))
+TAIL_SCHEDULE_SWITCH_STEP = int(os.environ.get("TAIL_SCHEDULE_SWITCH_STEP", "2650"))
+TAIL_SCHEDULE_STEPS = int(os.environ.get("TAIL_SCHEDULE_STEPS", "3000"))
+TAIL_SCHEDULE_RAMP_START_STEP = int(os.environ.get("TAIL_SCHEDULE_RAMP_START_STEP", "0"))
+TAIL_SCHEDULE_RAMP_END_STEP = int(os.environ.get("TAIL_SCHEDULE_RAMP_END_STEP", "0"))
+TAIL_SCHEDULE_STAGE2_SWITCH_STEP = int(os.environ.get("TAIL_SCHEDULE_STAGE2_SWITCH_STEP", "0"))
+TAIL_SCHEDULE_STAGE2_STEPS = int(os.environ.get("TAIL_SCHEDULE_STAGE2_STEPS", str(TAIL_SCHEDULE_STEPS)))
+FINAL_LR_POWER = 1.2
+ADAM_EMBED_POWER_C = 4.976805410800738e-05
+ADAM_PROJ_POWER_C = 5.184172302917436e-07
+ADAM_OTHER_POWER_C = 1.6589351369335795e-06
+MUON_POWER_C = 3.3169534699576625e-06
+FINAL_MUON_WD = 0.025
+EXPERIMENT_NAME = "circuit-muon"
+EXPERIMENT_INTUITION = "PR309 (EMA-Nesterov + Aurora) plus Circuit-Muon on attn.v <-> attn.proj: per-head partner-scalar post-whitening (norm-preserving) + trace-only gauge rebalance."
+CONTRA_MUON_COEFF = float(os.environ.get("CONTRA_MUON_COEFF", "-0.2"))
+SOFT_MUON_P = float(os.environ.get("SOFT_MUON_P", "0.1"))
+SOFT_MUON_SCALE = os.environ.get("SOFT_MUON_SCALE", "none")
+SOFT_MUON_INPUT_NORM = os.environ.get("SOFT_MUON_INPUT_NORM", "frobenius_schatten4")
+SOFT_MUON_CEIL = float(os.environ.get("SOFT_MUON_CEIL", "0.00"))
+CONTRA_HOLD_END_STEP = 0
+CONTRA_TO_NORMAL_END_STEP = int(os.environ.get("CONTRA_TO_NORMAL_END_STEP", "2500"))
+NORMAL_TO_SOFT_START_STEP = int(os.environ.get("NORMAL_TO_SOFT_START_STEP", "2500"))
+NORMAL_TO_SOFT_END_STEP = int(os.environ.get("NORMAL_TO_SOFT_END_STEP", "3010"))
+MUON_HISTORY_STEPS = int(os.environ.get("MUON_HISTORY_STEPS", "0"))
+MUON_HISTORY_STEPS_LATE = int(os.environ.get("MUON_HISTORY_STEPS_LATE", str(MUON_HISTORY_STEPS)))
+MUON_HISTORY_STEPS_SWITCH_STEP = int(os.environ.get("MUON_HISTORY_STEPS_SWITCH_STEP", "0"))
+MUON_HISTORY_BLEND = float(os.environ.get("MUON_HISTORY_BLEND", "0.25"))
+MUON_HISTORY_BLEND_LATE = float(os.environ.get("MUON_HISTORY_BLEND_LATE", str(MUON_HISTORY_BLEND)))
+MUON_HISTORY_BLEND_SWITCH_STEP = int(os.environ.get("MUON_HISTORY_BLEND_SWITCH_STEP", "0"))
+MUON_HISTORY_LOOKAHEAD = float(os.environ.get("MUON_HISTORY_LOOKAHEAD", "1.0"))
+MUON_HISTORY_MIN_COS = float(os.environ.get("MUON_HISTORY_MIN_COS", "0.25"))
+MUON_HISTORY_MIN_COS_LATE = float(os.environ.get("MUON_HISTORY_MIN_COS_LATE", str(MUON_HISTORY_MIN_COS)))
+MUON_HISTORY_MIN_COS_DECAY_START_STEP = int(os.environ.get("MUON_HISTORY_MIN_COS_DECAY_START_STEP", "0"))
+MUON_HISTORY_MIN_COS_DECAY_END_STEP = int(os.environ.get("MUON_HISTORY_MIN_COS_DECAY_END_STEP", "0"))
+MUON_HISTORY_MAX_DELTA = float(os.environ.get("MUON_HISTORY_MAX_DELTA", "0.25"))
+MUON_HISTORY_ADAPTIVE_STEPS = int(os.environ.get("MUON_HISTORY_ADAPTIVE_STEPS", "0"))
+MUON_HISTORY_ADAPT_MARGIN = float(os.environ.get("MUON_HISTORY_ADAPT_MARGIN", "0.02"))
+MUON_HISTORY_ADAPT_DELTA_RATIO = float(os.environ.get("MUON_HISTORY_ADAPT_DELTA_RATIO", "1.25"))
+MUON_HISTORY_DIAG = bool(int(os.environ.get("MUON_HISTORY_DIAG", "0")))
+MUON_HISTORY_DIAG_EVERY = int(os.environ.get("MUON_HISTORY_DIAG_EVERY", "250"))
+MUON_HISTORY_DECAY_START_STEP = int(os.environ.get("MUON_HISTORY_DECAY_START_STEP", "2400"))
+MUON_HISTORY_DECAY_END_STEP = int(os.environ.get("MUON_HISTORY_DECAY_END_STEP", str(FINAL_TRAIN_STEPS)))
+MUON_HISTORY_FINAL_BLEND_MULT = float(os.environ.get("MUON_HISTORY_FINAL_BLEND_MULT", "0.0"))
+MUON_HISTORY_SCOPE = os.environ.get("MUON_HISTORY_SCOPE", "all")
+MUON_HISTORY_BLOCK_MIN = int(os.environ.get("MUON_HISTORY_BLOCK_MIN", "-1"))
+MUON_HISTORY_BLOCK_MAX = int(os.environ.get("MUON_HISTORY_BLOCK_MAX", "-1"))
+MUON_HISTORY_STEPS_LATE_SCOPE = os.environ.get("MUON_HISTORY_STEPS_LATE_SCOPE", "all")
+MUON_HISTORY_STEPS_LATE_RAMP_START_STEP = int(os.environ.get("MUON_HISTORY_STEPS_LATE_RAMP_START_STEP", "0"))
+MUON_HISTORY_STEPS_LATE_RAMP_END_STEP = int(os.environ.get("MUON_HISTORY_STEPS_LATE_RAMP_END_STEP", "0"))
+CIRCUIT_HISTORY_STEPS = int(os.environ.get("CIRCUIT_HISTORY_STEPS", "0"))
+CIRCUIT_HISTORY_BLEND = float(os.environ.get("CIRCUIT_HISTORY_BLEND", "0.10"))
+CIRCUIT_HISTORY_LOOKAHEAD = float(os.environ.get("CIRCUIT_HISTORY_LOOKAHEAD", "1.0"))
+CIRCUIT_HISTORY_MIN_COS = float(os.environ.get("CIRCUIT_HISTORY_MIN_COS", "0.25"))
+CIRCUIT_HISTORY_MAX_DELTA = float(os.environ.get("CIRCUIT_HISTORY_MAX_DELTA", "0.15"))
+CIRCUIT_HISTORY_START_STEP = int(os.environ.get("CIRCUIT_HISTORY_START_STEP", "0"))
+CIRCUIT_HISTORY_SCOPE = os.environ.get("CIRCUIT_HISTORY_SCOPE", "both")
+CIRCUIT_HISTORY_DECAY_START_STEP = int(os.environ.get("CIRCUIT_HISTORY_DECAY_START_STEP", "2400"))
+CIRCUIT_HISTORY_DECAY_END_STEP = int(os.environ.get("CIRCUIT_HISTORY_DECAY_END_STEP", str(FINAL_TRAIN_STEPS)))
+CIRCUIT_HISTORY_FINAL_BLEND_MULT = float(os.environ.get("CIRCUIT_HISTORY_FINAL_BLEND_MULT", "0.0"))
+CIRCUIT_HISTORY_AGREE_SHRINK = bool(int(os.environ.get("CIRCUIT_HISTORY_AGREE_SHRINK", "0")))
+CIRCUIT_HISTORY_AGREE_MIN_SCALE = float(os.environ.get("CIRCUIT_HISTORY_AGREE_MIN_SCALE", "0.50"))
+SOAP_HISTORY_STEPS = int(os.environ.get("SOAP_HISTORY_STEPS", "0"))
+SOAP_HISTORY_BLEND = float(os.environ.get("SOAP_HISTORY_BLEND", "0.10"))
+SOAP_HISTORY_LOOKAHEAD = float(os.environ.get("SOAP_HISTORY_LOOKAHEAD", "1.0"))
+SOAP_HISTORY_MIN_COS = float(os.environ.get("SOAP_HISTORY_MIN_COS", "0.25"))
+SOAP_HISTORY_MAX_DELTA = float(os.environ.get("SOAP_HISTORY_MAX_DELTA", "0.15"))
+SOAP_HISTORY_DECAY_START_STEP = int(os.environ.get("SOAP_HISTORY_DECAY_START_STEP", "2400"))
+SOAP_HISTORY_DECAY_END_STEP = int(os.environ.get("SOAP_HISTORY_DECAY_END_STEP", str(FINAL_TRAIN_STEPS)))
+SOAP_HISTORY_FINAL_BLEND_MULT = float(os.environ.get("SOAP_HISTORY_FINAL_BLEND_MULT", "0.0"))
+MUON_OUTPUT_HISTORY_STEPS = int(os.environ.get("MUON_OUTPUT_HISTORY_STEPS", "0"))
+MUON_OUTPUT_HISTORY_BLEND = float(os.environ.get("MUON_OUTPUT_HISTORY_BLEND", "0.05"))
+MUON_OUTPUT_HISTORY_LOOKAHEAD = float(os.environ.get("MUON_OUTPUT_HISTORY_LOOKAHEAD", "1.0"))
+MUON_OUTPUT_HISTORY_MIN_COS = float(os.environ.get("MUON_OUTPUT_HISTORY_MIN_COS", "0.25"))
+MUON_OUTPUT_HISTORY_MAX_DELTA = float(os.environ.get("MUON_OUTPUT_HISTORY_MAX_DELTA", "0.10"))
+MUON_OUTPUT_HISTORY_DECAY_START_STEP = int(os.environ.get("MUON_OUTPUT_HISTORY_DECAY_START_STEP", "2400"))
+MUON_OUTPUT_HISTORY_DECAY_END_STEP = int(os.environ.get("MUON_OUTPUT_HISTORY_DECAY_END_STEP", str(FINAL_TRAIN_STEPS)))
+MUON_OUTPUT_HISTORY_FINAL_BLEND_MULT = float(os.environ.get("MUON_OUTPUT_HISTORY_FINAL_BLEND_MULT", "0.0"))
+RADIAL_HISTORY_BETA = float(os.environ.get("RADIAL_HISTORY_BETA", "0.0"))
+RADIAL_HISTORY_BLEND = float(os.environ.get("RADIAL_HISTORY_BLEND", "0.0"))
+RADIAL_HISTORY_START_STEP = int(os.environ.get("RADIAL_HISTORY_START_STEP", "0"))
+RADIAL_HISTORY_END_STEP = int(os.environ.get("RADIAL_HISTORY_END_STEP", str(FINAL_TRAIN_STEPS)))
+ATTN_TRUST_HISTORY_BETA = float(os.environ.get("ATTN_TRUST_HISTORY_BETA", "0.0"))
+ATTN_TRUST_HISTORY_BLEND = float(os.environ.get("ATTN_TRUST_HISTORY_BLEND", "0.0"))
+ATTN_TRUST_HISTORY_START_STEP = int(os.environ.get("ATTN_TRUST_HISTORY_START_STEP", "0"))
+ATTN_TRUST_HISTORY_END_STEP = int(os.environ.get("ATTN_TRUST_HISTORY_END_STEP", str(FINAL_TRAIN_STEPS)))
+MUON_OUTPUT_EMA_BETA = float(os.environ.get("MUON_OUTPUT_EMA_BETA", "0.0"))
+MUON_OUTPUT_EMA_BLEND = float(os.environ.get("MUON_OUTPUT_EMA_BLEND", "0.0"))
+MUON_OUTPUT_EMA_MIN_COS = float(os.environ.get("MUON_OUTPUT_EMA_MIN_COS", "0.25"))
+MUON_OUTPUT_EMA_START_STEP = int(os.environ.get("MUON_OUTPUT_EMA_START_STEP", "0"))
+MUON_OUTPUT_EMA_END_STEP = int(os.environ.get("MUON_OUTPUT_EMA_END_STEP", str(FINAL_TRAIN_STEPS)))
+CONTRA_HISTORY_STEPS = int(os.environ.get("CONTRA_HISTORY_STEPS", "0"))
+CONTRA_HISTORY_BLEND = float(os.environ.get("CONTRA_HISTORY_BLEND", "0.10"))
+CONTRA_HISTORY_LOOKAHEAD = float(os.environ.get("CONTRA_HISTORY_LOOKAHEAD", "1.0"))
+CONTRA_HISTORY_MIN_COS = float(os.environ.get("CONTRA_HISTORY_MIN_COS", "0.25"))
+CONTRA_HISTORY_MAX_DELTA = float(os.environ.get("CONTRA_HISTORY_MAX_DELTA", "0.15"))
+CONTRA_HISTORY_START_STEP = int(os.environ.get("CONTRA_HISTORY_START_STEP", "0"))
+CONTRA_HISTORY_END_STEP = int(os.environ.get("CONTRA_HISTORY_END_STEP", "2500"))
+MU = 0.95
+MUON_LR = 0.0375
+MUON_WEIGHT_DECAY = FINAL_MUON_WD
+TARGET_UW = 0.3825
+SOAP_TARGET_UW = TARGET_UW
+NONSOAP_TARGET_UW = TARGET_UW
+NOR_BETA2 = 1.0
+SOAP_BETA2 = 0.90
+SOAP_PRECONDITION_FREQUENCY = 10
+SOAP_DENOM_POWER = 0.50
+SOAP_BLEND = 1.00
+SOAP_UPDATE_BEFORE_USE = False
+SOAP_PARAM_MODE = "mlp_plus_v"
+ATTN_SOAP_DENOM_FLOOR = 0.55
+ATTN_SOAP_BLEND = 1.00
+V_SOAP_BLEND = 0.95
+V_SOAP_BLEND_RAMP_END_STEP = 0
+ATTN_EARLY_TRUST_FLOOR = 0.45
+ATTN_EARLY_TRUST_CAP = 0.85
+ATTN_TRUST_FLOOR_END_STEP = 1375
+ATTN_TRUST_FLOOR_FADE_END_STEP = 1625
+ATTN_TRUST_MIN_AGREE = 0.20
+ATTN_TRUST_MIN_GRAD_ALIGN = 0.00
+ATTN_TRUST_POWER = 1.00
+ATTN_SOAP_FADE_START_STEP = 1000000000
+ATTN_SOAP_FADE_END_STEP = 1000000000
+NO_CONTRA_PARAM = ""
+NO_SOFTMUON_PARAM = ""
+TRAIN_PROGRESS_INTERVAL = int(os.environ.get("TRAIN_PROGRESS_INTERVAL", "0"))
+LOG_DIR = Path(os.environ.get("LOG_DIR", "logs"))
+RADIAL_OUTWARD_SCALE = 0.5
+RADIAL_INWARD_SCALE = 1.0
+DENSE_EVAL_START = int(os.environ.get("DENSE_EVAL_START", str(FINAL_TRAIN_STEPS)))
+DENSE_EVAL_END = int(os.environ.get("DENSE_EVAL_END", str(FINAL_TRAIN_STEPS)))
+DENSE_EVAL_STRIDE = int(os.environ.get("DENSE_EVAL_STRIDE", "10"))
+EMA_NESTEROV_REST_STEPS = int(os.environ.get("EMA_NESTEROV_REST_STEPS", str(FINAL_TRAIN_STEPS - 950)))
+MU_COOLDOWN_STEPS = int(os.environ.get("MU_COOLDOWN_STEPS", "100"))
+TRAIL_DELTA_START_STEP = int(os.environ.get("TRAIL_DELTA_START_STEP", "2650"))
+TRAIL_DELTA_END_STEP = int(os.environ.get("TRAIL_DELTA_END_STEP", str(FINAL_TRAIN_STEPS)))
+TRAIL_DELTA_INTERVAL = int(os.environ.get("TRAIL_DELTA_INTERVAL", "100"))
+TRAIL_DELTA_GAMMA = float(os.environ.get("TRAIL_DELTA_GAMMA", "-0.08"))
+TRAIL_DELTA_GAMMA_FIRST = float(os.environ.get("TRAIL_DELTA_GAMMA_FIRST", str(TRAIL_DELTA_GAMMA)))
+TRAIL_DELTA_GAMMA_FINAL = float(os.environ.get("TRAIL_DELTA_GAMMA_FINAL", str(TRAIL_DELTA_GAMMA)))
+TRAIL_DELTA_SCOPE = os.environ.get("TRAIL_DELTA_SCOPE", "nonembed")
+TRAIL_DELTA_MAX_MOVE_RATIO = float(os.environ.get("TRAIL_DELTA_MAX_MOVE_RATIO", "0.0"))
+TRAIL_DELTA_MOMENTUM_BETA = float(os.environ.get("TRAIL_DELTA_MOMENTUM_BETA", "0.0"))
+TRAIL_DELTA_SYNC_NESTEROV_STATE = bool(int(os.environ.get("TRAIL_DELTA_SYNC_NESTEROV_STATE", "0")))
+TRAIL_DELTA_LOOKAHEAD_INJECT = float(os.environ.get("TRAIL_DELTA_LOOKAHEAD_INJECT", "0.0"))
+TRAIL_DELTA_ADAM_MOMENT_DAMP = float(os.environ.get("TRAIL_DELTA_ADAM_MOMENT_DAMP", "1.0"))
+TRAIL_DELTA_MUON_MOMENT_DAMP = float(os.environ.get("TRAIL_DELTA_MUON_MOMENT_DAMP", "1.0"))
+STATE_REFRESH_SCHEDULE = os.environ.get("STATE_REFRESH_SCHEDULE", "")
+STATE_REFRESH_ADAM_EXP_AVG_DAMP = float(os.environ.get("STATE_REFRESH_ADAM_EXP_AVG_DAMP", "0.0"))
+STATE_REFRESH_ADAM_EXP_AVG_SQ_DAMP = float(os.environ.get("STATE_REFRESH_ADAM_EXP_AVG_SQ_DAMP", "1.0"))
+STATE_REFRESH_MUON_MOMENTUM_DAMP = float(os.environ.get("STATE_REFRESH_MUON_MOMENTUM_DAMP", "0.0"))
+STATE_REFRESH_MUON_SECOND_DAMP = float(os.environ.get("STATE_REFRESH_MUON_SECOND_DAMP", "1.0"))
+STATE_REFRESH_LOOKAHEAD_DAMP = float(os.environ.get("STATE_REFRESH_LOOKAHEAD_DAMP", "0.0"))
+BROAD_DELTA_CAPTURE_STEP = int(os.environ.get("BROAD_DELTA_CAPTURE_STEP", "0"))
+BROAD_DELTA_APPLY_STEP = int(os.environ.get("BROAD_DELTA_APPLY_STEP", "0"))
+BROAD_DELTA_GAMMA = float(os.environ.get("BROAD_DELTA_GAMMA", "0.0"))
+BROAD_DELTA_SCOPE = os.environ.get("BROAD_DELTA_SCOPE", "nonembed")
+BROAD_DELTA_MAX_MOVE_RATIO = float(os.environ.get("BROAD_DELTA_MAX_MOVE_RATIO", "0.0"))
+BROAD_DELTA_SCHEDULE = os.environ.get("BROAD_DELTA_SCHEDULE", "")
+FINAL_READOUT_ANCHOR_STEP = int(os.environ.get("FINAL_READOUT_ANCHOR_STEP", "0"))
+FINAL_READOUT_APPLY_STEP = int(os.environ.get("FINAL_READOUT_APPLY_STEP", str(FINAL_TRAIN_STEPS)))
+FINAL_READOUT_ALPHA = float(os.environ.get("FINAL_READOUT_ALPHA", "0.0"))
+FINAL_READOUT_SCOPE = os.environ.get("FINAL_READOUT_SCOPE", "nonembed")
+FINAL_READOUT_MAX_MOVE_RATIO = float(os.environ.get("FINAL_READOUT_MAX_MOVE_RATIO", "0.0"))
+FINAL_READOUT_LINESEARCH_ALPHAS = os.environ.get("FINAL_READOUT_LINESEARCH_ALPHAS", "")
+FINAL_READOUT_LINESEARCH_MICROBATCHES = int(os.environ.get("FINAL_READOUT_LINESEARCH_MICROBATCHES", "4"))
+FINAL_READOUT_SWEEP_ALPHAS = os.environ.get("FINAL_READOUT_SWEEP_ALPHAS", "")
+CURVE_READOUT_WINDOW = int(os.environ.get("CURVE_READOUT_WINDOW", "0"))
+CURVE_READOUT_START_STEP = int(os.environ.get(
+    "CURVE_READOUT_START_STEP",
+    str(FINAL_TRAIN_STEPS - CURVE_READOUT_WINDOW + 1 if CURVE_READOUT_WINDOW > 0 else 0),
+))
+CURVE_READOUT_APPLY_STEP = int(os.environ.get("CURVE_READOUT_APPLY_STEP", str(FINAL_TRAIN_STEPS)))
+CURVE_READOUT_DEGREE = int(os.environ.get("CURVE_READOUT_DEGREE", "1"))
+CURVE_READOUT_PREDICT_AHEAD = float(os.environ.get("CURVE_READOUT_PREDICT_AHEAD", "1.0"))
+CURVE_READOUT_MODE = os.environ.get("CURVE_READOUT_MODE", "point")
+CURVE_READOUT_SCOPE = os.environ.get("CURVE_READOUT_SCOPE", "nonembed")
+CURVE_READOUT_MAX_MOVE_RATIO = float(os.environ.get("CURVE_READOUT_MAX_MOVE_RATIO", "0.0"))
+CURVE_READOUT_BLEND = float(os.environ.get("CURVE_READOUT_BLEND", "1.0"))
+CURVE_READOUT_COLLECT_BEFORE_TRAIL_DELTA = bool(int(os.environ.get("CURVE_READOUT_COLLECT_BEFORE_TRAIL_DELTA", "0")))
+CURVE_READOUT_LINESEARCH_BLENDS = os.environ.get("CURVE_READOUT_LINESEARCH_BLENDS", "")
+CURVE_READOUT_LINESEARCH_MICROBATCHES = int(os.environ.get("CURVE_READOUT_LINESEARCH_MICROBATCHES", "4"))
+CURVE_READOUT_SWEEP_AHEADS = os.environ.get("CURVE_READOUT_SWEEP_AHEADS", "")
+CURVE_READOUT_SWEEP_BLENDS = os.environ.get("CURVE_READOUT_SWEEP_BLENDS", "")
+CURVE_READOUT_SWEEP_MODES = os.environ.get("CURVE_READOUT_SWEEP_MODES", "")
+CHECKPOINT_DIR = Path(os.environ.get("CHECKPOINT_DIR", "/tmp/trajectory_readout_v3/checkpoints"))
+CHECKPOINT_PREFIX = os.environ.get("CHECKPOINT_PREFIX", f"pr311_seed{SEED}")
+SAVE_CHECKPOINT_STEPS = {
+    int(part.strip())
+    for part in os.environ.get("SAVE_CHECKPOINT_STEPS", "").split(",")
+    if part.strip()
+}
+LOAD_CHECKPOINT = os.environ.get("LOAD_CHECKPOINT", "")
+ALIGN_DATALOADER_ON_LOAD = bool(int(os.environ.get("ALIGN_DATALOADER_ON_LOAD", "1" if LOAD_CHECKPOINT else "0")))
+EXIT_AFTER_SAVE_CHECKPOINT = bool(int(os.environ.get("EXIT_AFTER_SAVE_CHECKPOINT", "0")))
+EXIT_AFTER_SAVE_CHECKPOINT_STEP = int(os.environ.get("EXIT_AFTER_SAVE_CHECKPOINT_STEP", "0"))
+MACRO_CEM_MODE = bool(int(os.environ.get("MACRO_CEM_MODE", "0")))
+MACRO_CEM_GROUP_MODE = bool(int(os.environ.get("MACRO_CEM_GROUP_MODE", "0")))
+MACRO_REF_T0 = os.environ.get("MACRO_REF_T0", "")
+MACRO_REF_T1 = os.environ.get("MACRO_REF_T1", "")
+MACRO_REF_T2 = os.environ.get("MACRO_REF_T2", "")
+MACRO_CEM_SAMPLES = int(os.environ.get("MACRO_CEM_SAMPLES", "12"))
+MACRO_CEM_ELITES = int(os.environ.get("MACRO_CEM_ELITES", "3"))
+MACRO_CEM_ITERS = int(os.environ.get("MACRO_CEM_ITERS", "2"))
+MACRO_CEM_SEED = int(os.environ.get("MACRO_CEM_SEED", "1234"))
+MACRO_CEM_CALIB_MICROBATCHES = int(os.environ.get("MACRO_CEM_CALIB_MICROBATCHES", "4"))
+MODEL_LAYERS = int(os.environ.get("MODEL_LAYERS", "12"))
+MODEL_DIM = int(os.environ.get("MODEL_DIM", "768"))
+VOCAB_SIZE = int(os.environ.get("VOCAB_SIZE", "50304"))
+VAL_TOKENS = int(os.environ.get("VAL_TOKENS", str(20 * 524288)))
+BATCH_TOKENS = int(os.environ.get("BATCH_TOKENS", str(8 * 64 * 1024)))
+MICRO_BATCH_SEQS = int(os.environ.get("MICRO_BATCH_SEQS", "64"))
+VAL_REGULAR_INTERVAL = int(os.environ.get("VAL_REGULAR_INTERVAL", "125"))
+# Circuit-Muon (OV pair: attn.v <-> attn.proj). The damping sets the floor on the
+# per-head Gram-root scalar c^2 = ||W_h||_F^2 / hd. The chosen value 1e-3 keeps
+# s_partner = 1/sqrt(c^2 + lam) bounded at init (~32 with zero-init proj) while
+# preserving per-head anisotropy of s; it was selected from a sweep over
+# {1e-6, 1e-5, 1e-4, 1e-3, 1e-2} (1e-3 best mean@end, lowest std).
+HEAD_DIM = 128
+CIRCUIT_OV_DAMPING = 1e-3
+
+
+########################################
+#              Dataloader              #
+########################################
+
+def _load_data_shard(file: Path):
+    header = torch.from_file(str(file), False, 256, dtype=torch.int32) # header is 256 int32
+    assert header[0] == 20240520, "magic number mismatch in the data .bin file"
+    assert header[1] == 1, "unsupported version"
+    num_tokens = int(header[2]) # number of tokens (claimed)
+    with file.open("rb", buffering=0) as f:
+        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True)
+        f.seek(256 * 4)
+        nbytes = f.readinto(tokens.numpy()) # avoid bytes->array copy
+        assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
+    return tokens
+
+def distributed_data_generator(filename_pattern: str, batch_size: int, seq_len=1024):
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+    files = sorted(Path.cwd().glob(filename_pattern))
+    assert batch_size % world_size == 0
+    local_batch_size = batch_size // world_size
+    file_iter = iter(files)
+    tokens, pos = _load_data_shard(next(file_iter)), 0
+    while True:
+        if pos + batch_size + 1 >= len(tokens):
+            tokens, pos = _load_data_shard(next(file_iter)), 0
+        buf = tokens[pos + rank * local_batch_size:][:local_batch_size + 1]
+        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True)
+        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True)
+        pos += batch_size
+        yield inputs.view(-1, seq_len), targets.view(-1, seq_len)
+
+
+########################################
+#             Architecture             #
+########################################
+
+def norm(x: Tensor):
+    return F.rms_norm(x, (x.size(-1),))
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.gains = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        return (norm(x.float()) * self.gains).type_as(x)
+
+class Linear(nn.Linear):
+    def __init__(self, in_features, out_features):
+        super().__init__(in_features, out_features, bias=True)
+
+    def forward(self, x):
+        return F.linear(x, self.weight.type_as(x), self.bias.type_as(x))
+
+class Rotary(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        # half-truncate RoPE (w/ base freq tuning)
+        angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
+        self.register_buffer("angular_freq", torch.cat([angular_freq, angular_freq.new_zeros(dim//4)]))
+
+    def forward(self, x_BTHD: Tensor):
+        pos = torch.arange(x_BTHD.size(1), dtype=torch.float32, device=x_BTHD.device)
+        theta = torch.outer(pos, self.angular_freq)[None, :, None, :]
+        cos, sin = theta.cos(), theta.sin()
+        x1, x2 = x_BTHD.to(dtype=torch.float32).chunk(2, dim=-1)
+        y1 = x1 * cos + x2 * sin
+        y2 = x1 * (-sin) + x2 * cos
+        return torch.cat((y1, y2), 3).type_as(x_BTHD)
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, dim: int, head_dim=128):
+        super().__init__()
+        self.num_heads = dim // head_dim
+        self.head_dim = head_dim
+        hdim = self.num_heads * self.head_dim
+        self.q = Linear(dim, hdim)
+        self.k = Linear(dim, hdim)
+        self.v = Linear(dim, hdim)
+        self.proj = Linear(hdim, dim)
+        self.rotary = Rotary(head_dim)
+
+    def forward(self, x: Tensor):
+        B, T = x.size(0), x.size(1)
+        q = self.q(x).view(B, T, self.num_heads, self.head_dim)
+        k = self.k(x).view(B, T, self.num_heads, self.head_dim)
+        v = self.v(x).view(B, T, self.num_heads, self.head_dim)
+        q, k = norm(q), norm(k)
+        q, k = self.rotary(q), self.rotary(k)
+        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2),
+                                           v.transpose(1, 2), scale=0.12, is_causal=True).transpose(1, 2)
+        y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
+        y = self.proj(y)
+        return y
+
+class MLP(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        hdim = 4 * dim
+        self.fc = Linear(dim, hdim)
+        self.proj = Linear(hdim, dim)
+
+    def forward(self, x: Tensor):
+        x = self.fc(x)
+        x = x.relu().square()
+        x = self.proj(x)
+        return x
+
+class Block(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.attn = CausalSelfAttention(dim)
+        self.mlp = MLP(dim)
+        self.norm1 = RMSNorm(dim)
+        self.norm2 = RMSNorm(dim)
+
+    def forward(self, x: Tensor):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+class GPT(nn.Module):
+    def __init__(self, vocab_size: int, num_layers: int, model_dim: int):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, model_dim).bfloat16()
+        self.blocks = nn.ModuleList([Block(model_dim) for _ in range(num_layers)])
+        self.proj = Linear(model_dim, vocab_size)
+        self.norm1 = RMSNorm(model_dim)
+        self.norm2 = RMSNorm(model_dim)
+
+    def forward(self, inputs: Tensor, targets: Tensor):
+        x = self.norm1(self.embed(inputs))
+        for block in self.blocks:
+            x = block(x)
+        logits = self.proj(self.norm2(x)).float()
+        logits = 15 * logits * (logits.square() + 15**2).rsqrt()
+        return F.cross_entropy(logits.view(targets.numel(), -1), targets.view(-1), reduction="sum")
+
+
+########################################
+#              Optimizer               #
+########################################
+
+def gram_frobenius_norm_estimate(G: Tensor, keepdim: bool = False, eps: float = 1e-10) -> Tensor:
+    X = G.float()
+    gram = X.mT @ X if X.size(-2) > X.size(-1) else X @ X.mT
+    return gram.norm(dim=(-2, -1), keepdim=keepdim).sqrt().clamp_min(eps)
+
+def _ns_inner(X: Tensor) -> Tensor:
+    a, b, c = 2, -1.5, 0.5
+    for _ in range(12):
+        A = X @ X.mT
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+    return X
+
+# v93: Aurora-on-mlp.proj (K=3 outer iterations with D row rescaling)
+_AURORA_K = 3
+_AURORA_BETA = 0.25
+_AURORA_EPS = 1e-7
+
+def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
+    assert G.ndim >= 2
+    is_originally_wide = G.size(-2) < G.size(-1)
+    X = G.bfloat16()
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+
+    if is_originally_wide:
+        Xt = X.mT
+        Xt32 = Xt.to(torch.float32)
+        target_row_sq = Xt.size(-1) / Xt.size(-2)
+        row_norm = Xt32.norm(dim=-1, keepdim=True).clamp_(min=_AURORA_EPS)
+        D = 1.0 / row_norm
+        U = None
+        for k in range(_AURORA_K):
+            scaled = (D * Xt32).to(Xt.dtype)
+            scaled_wide = scaled.mT
+            scaled_wide = scaled_wide / gram_frobenius_norm_estimate(scaled_wide, keepdim=True, eps=1e-7).to(scaled_wide.dtype)
+            U_wide = _ns_inner(scaled_wide)
+            U = U_wide.mT
+            if k < _AURORA_K - 1:
+                U32 = U.to(torch.float32)
+                row_sq = U32.pow(2).sum(dim=-1, keepdim=True).clamp_(min=_AURORA_EPS * _AURORA_EPS)
+                D = D * (target_row_sq / row_sq).pow(_AURORA_BETA)
+        X = U.mT
+    else:
+        X = X / gram_frobenius_norm_estimate(X, keepdim=True, eps=1e-7).to(X.dtype)
+        X = _ns_inner(X)
+
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    return X
+
+def _soft_coefficients(p: float) -> tuple[float, tuple[float, ...]]:
+    soft_p01_coeffs = (0.1091613623, 0.07085664498, 0.05210528973, 0.05457295795, 0.05011334061, 0.03334622198, 0.05022104481, 0.1053727358, 0.1187323776, 0.1185061091, 0.1185059576, 0.1185059576)
+    if abs(p - 0.0) < 1e-12:
+        return 1.0, (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    if abs(p - 0.1) < 1e-12:
+        return 0.0, soft_p01_coeffs
+    if 0.0 <= p <= 0.2:
+        # Local sweep support: interpolate the existing p=0.1 soft transfer with
+        # hard polar p=0.0. The p=0.1 path is unchanged byte-for-byte.
+        alpha = p / 0.1
+        return 1.0 - alpha, tuple(alpha * coeff for coeff in soft_p01_coeffs)
+    raise ValueError(f"unsupported soft-muon singular-value power: {p}")
+
+def zeropower_frobenius_norm_like(G: Tensor) -> float:
+    return (G.numel() / max(G.size(-2), G.size(-1)))**0.5
+
+def soft_via_newtonschulz5(G: Tensor, p: float, scale_mode: str, input_norm: str) -> Tensor:
+    assert G.ndim >= 2
+    X = G.bfloat16()
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+
+    if input_norm == "frobenius_schatten4":
+        X = X / gram_frobenius_norm_estimate(X, keepdim=True, eps=1e-7).to(X.dtype)
+    elif input_norm != "frobenius":
+        raise ValueError(f"unsupported soft_muon input_norm: {input_norm}")
+    else:
+        X = X / gram_frobenius_norm_estimate(X, keepdim=True, eps=1e-7).to(X.dtype)
+    constant, coeffs = _soft_coefficients(p)
+
+    a, b, c = 2, -1.5, 0.5
+    basis = [X]
+    for _ in range(len(coeffs)):
+        A = X @ X.mT
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+        basis.append(X)
+
+    out = constant * basis[-1]
+    for coeff, basis_term in zip(coeffs, basis[:-1]):
+        out = out + coeff * basis_term
+
+    value_at_one = constant + sum(coeffs)
+    if scale_mode == "top":
+        out = out / value_at_one
+    elif scale_mode == "top_sqrt":
+        out = out / value_at_one**0.5
+    elif scale_mode == "frobenius":
+        theoretical_opower_norm = zeropower_frobenius_norm_like(out)
+        out = out * theoretical_opower_norm / gram_frobenius_norm_estimate(out)
+    elif scale_mode == "frobenius_sqrt":
+        theoretical_opower_norm = zeropower_frobenius_norm_like(out)
+        out = out * (theoretical_opower_norm / gram_frobenius_norm_estimate(out))**0.5
+    elif scale_mode != "none":
+        raise ValueError(f"unsupported soft_muon scale: {scale_mode}")
+
+    if G.size(-2) > G.size(-1):
+        out = out.mT
+    return out
+
+def scale_to_unit_operator_norm(G: Tensor, eps: float = 1e-10) -> Tensor:
+    return G / gram_frobenius_norm_estimate(G, eps=eps).to(G.dtype)
+
+def _scheduled_history_blend(base_blend: float, step: int, group: dict) -> float:
+    blend = base_blend
+    blend_switch = int(group.get("muon_history_blend_switch_step", 0) or 0)
+    if blend_switch > 0 and step >= blend_switch:
+        blend = float(group.get("muon_history_blend_late", blend) or blend)
+    decay_start = int(group.get("muon_history_decay_start_step", -1))
+    decay_end = int(group.get("muon_history_decay_end_step", -1))
+    final_mult = float(group.get("muon_history_final_blend_mult", 1.0))
+    if decay_start >= 0 and decay_end > decay_start and step >= decay_start:
+        progress = min(1.0, max(0.0, (step - decay_start) / (decay_end - decay_start)))
+        blend *= (1.0 - progress) + progress * final_mult
+    return blend
+
+def _scheduled_scalar_history_blend(base_blend: float, step: int, decay_start: int, decay_end: int, final_mult: float) -> float:
+    blend = base_blend
+    if decay_start >= 0 and decay_end > decay_start and step >= decay_start:
+        progress = min(1.0, max(0.0, (step - decay_start) / (decay_end - decay_start)))
+        blend *= (1.0 - progress) + progress * final_mult
+    return blend
+
+muon_history_diag_stats = {}
+muon_history_pair_diag_stats = {}
+
+def _diag_scalar_sum(x: Tensor) -> float:
+    return float(x.detach().float().sum().item())
+
+def _diag_record_muon_history(step: int, label: str, cos: Tensor, delta_norm: Tensor, cur_norm: Tensor, min_cos: float):
+    if not MUON_HISTORY_DIAG:
+        return
+    stats = muon_history_diag_stats.setdefault(label, {
+        "calls": 0,
+        "items": 0,
+        "aligned": 0,
+        "cos_sum": 0.0,
+        "delta_rel_sum": 0.0,
+        "cos_min": 1e9,
+        "cos_max": -1e9,
+        "step_first": step,
+        "step_last": step,
+    })
+    cos_f = cos.detach().float()
+    rel = (delta_norm.detach().float() / cur_norm.detach().float().clamp_min(1e-10))
+    aligned = cos_f >= float(min_cos)
+    stats["calls"] += 1
+    stats["items"] += cos_f.numel()
+    stats["aligned"] += int(aligned.sum().item())
+    stats["cos_sum"] += _diag_scalar_sum(cos_f)
+    stats["delta_rel_sum"] += _diag_scalar_sum(rel)
+    stats["cos_min"] = min(stats["cos_min"], float(cos_f.min().item()))
+    stats["cos_max"] = max(stats["cos_max"], float(cos_f.max().item()))
+    stats["step_last"] = step
+
+def _diag_record_muon_history_pair(step: int, label: str, a: Tensor, b: Tensor, cur_norm: Tensor):
+    if not MUON_HISTORY_DIAG:
+        return
+    stats = muon_history_pair_diag_stats.setdefault(label, {
+        "calls": 0,
+        "items": 0,
+        "cos_sum": 0.0,
+        "diff_rel_sum": 0.0,
+        "cos_min": 1e9,
+        "cos_max": -1e9,
+        "step_first": step,
+        "step_last": step,
+    })
+    a_norm = a.detach().float().norm(dim=(-2, -1), keepdim=True).clamp_min(1e-10)
+    b_norm = b.detach().float().norm(dim=(-2, -1), keepdim=True).clamp_min(1e-10)
+    cos = (a.detach().float() * b.detach().float()).sum(dim=(-2, -1), keepdim=True) / (a_norm * b_norm)
+    diff_rel = (a.detach().float() - b.detach().float()).norm(dim=(-2, -1), keepdim=True) / cur_norm.detach().float().clamp_min(1e-10)
+    stats["calls"] += 1
+    stats["items"] += cos.numel()
+    stats["cos_sum"] += _diag_scalar_sum(cos)
+    stats["diff_rel_sum"] += _diag_scalar_sum(diff_rel)
+    stats["cos_min"] = min(stats["cos_min"], float(cos.min().item()))
+    stats["cos_max"] = max(stats["cos_max"], float(cos.max().item()))
+    stats["step_last"] = step
+
+def flush_muon_history_diag(step: int):
+    if not MUON_HISTORY_DIAG or (not muon_history_diag_stats and not muon_history_pair_diag_stats):
+        return
+    parts = []
+    for label in sorted(muon_history_diag_stats):
+        stats = muon_history_diag_stats[label]
+        items = max(1, stats["items"])
+        parts.append(
+            f"{label}:calls={stats['calls']} items={stats['items']} "
+            + f"accept={stats['aligned']/items:.3f} "
+            + f"cos_mean={stats['cos_sum']/items:.4f} "
+            + f"cos_min={stats['cos_min']:.4f} cos_max={stats['cos_max']:.4f} "
+            + f"delta_rel={stats['delta_rel_sum']/items:.4f} "
+            + f"steps={stats['step_first']}..{stats['step_last']}"
+        )
+    for label in sorted(muon_history_pair_diag_stats):
+        stats = muon_history_pair_diag_stats[label]
+        items = max(1, stats["items"])
+        parts.append(
+            f"{label}:calls={stats['calls']} items={stats['items']} "
+            + f"cos_mean={stats['cos_sum']/items:.6f} "
+            + f"cos_min={stats['cos_min']:.6f} cos_max={stats['cos_max']:.6f} "
+            + f"diff_rel={stats['diff_rel_sum']/items:.6f} "
+            + f"steps={stats['step_first']}..{stats['step_last']}"
+        )
+    print0(f"muon_history_diag step:{step} " + " | ".join(parts), console=True)
+    muon_history_diag_stats.clear()
+    muon_history_pair_diag_stats.clear()
+
+def apply_direction_history(
+    update: Tensor,
+    state: dict,
+    step: int,
+    *,
+    key: str,
+    history_steps: int,
+    blend: float,
+    lookahead: float,
+    min_cos: float,
+    max_delta: float,
+    decay_start: int,
+    decay_end: int,
+    final_mult: float,
+    agree_shrink: bool = False,
+    agree_min_scale: float = 0.50,
+) -> Tensor:
+    if history_steps <= 0:
+        return update
+
+    buffer_key = f"{key}_buffer"
+    if buffer_key not in state:
+        state[buffer_key] = torch.zeros((history_steps, *update.shape), dtype=update.dtype, device=update.device)
+    history = state[buffer_key]
+    current_g = update
+
+    if step > history_steps:
+        cur_norm = current_g.float().norm(dim=(-2, -1), keepdim=True).clamp_min(1e-10)
+        history_blend = _scheduled_scalar_history_blend(blend, step, decay_start, decay_end, final_mult)
+
+        if history_blend > 0.0:
+            num_points = history_steps + 1
+            x_mean = history_steps / 2.0
+            x_pred = history_steps + lookahead
+            denom = sum((i - x_mean) ** 2 for i in range(num_points))
+            current_weight = 1.0 / num_points + (x_pred - x_mean) * (history_steps - x_mean) / denom
+            pred = current_g * current_weight
+            for i in range(history_steps):
+                weight = 1.0 / num_points + (x_pred - x_mean) * (i - x_mean) / denom
+                pred = pred + history[i].to(current_g.dtype) * weight
+
+            delta = pred - current_g
+            delta_norm = delta.float().norm(dim=(-2, -1), keepdim=True).clamp_min(1e-10)
+            delta_cap = max_delta * cur_norm
+            delta = delta * torch.minimum(torch.ones_like(delta_norm), delta_cap / delta_norm).to(delta.dtype)
+            if agree_shrink:
+                prev_delta_key = f"{key}_prev_delta"
+                prev_delta = state.get(prev_delta_key)
+                if prev_delta is not None and prev_delta.shape == delta.shape:
+                    prev_norm = prev_delta.float().norm(dim=(-2, -1), keepdim=True).clamp_min(1e-10)
+                    cur_delta_norm = delta.float().norm(dim=(-2, -1), keepdim=True).clamp_min(1e-10)
+                    agree_cos = (delta.float() * prev_delta.float()).sum(dim=(-2, -1), keepdim=True) / (cur_delta_norm * prev_norm)
+                    agree_scale = ((1.0 + agree_cos) * 0.5).clamp(min=agree_min_scale, max=1.0).to(delta.dtype)
+                    delta = delta * agree_scale
+                state[prev_delta_key] = delta.detach().clone()
+            candidate = current_g + history_blend * delta
+            cand_norm = candidate.float().norm(dim=(-2, -1), keepdim=True).clamp_min(1e-10)
+            cos = (candidate.float() * current_g.float()).sum(dim=(-2, -1), keepdim=True) / (cand_norm * cur_norm)
+            aligned = cos >= min_cos
+            update = torch.where(aligned, candidate, current_g)
+            update = update * (cur_norm / update.float().norm(dim=(-2, -1), keepdim=True).clamp_min(1e-10)).to(update.dtype)
+
+    if history_steps > 1:
+        history[:-1].copy_(history[1:].clone())
+    history[history_steps - 1].copy_(current_g)
+    return update
+
+def apply_direction_ema_blend(
+    update: Tensor,
+    state: dict,
+    step: int,
+    *,
+    key: str,
+    beta: float,
+    blend: float,
+    min_cos: float,
+    start_step: int,
+    end_step: int,
+) -> Tensor:
+    if beta <= 0.0 or blend <= 0.0:
+        return update
+    ema_key = f"{key}_ema"
+    current = update
+    if ema_key not in state:
+        state[ema_key] = current.detach().clone()
+        return update
+    ema = state[ema_key]
+    if step >= start_step and step <= end_step:
+        cur_norm = current.float().norm(dim=(-2, -1), keepdim=True).clamp_min(1e-10)
+        ema_norm = ema.float().norm(dim=(-2, -1), keepdim=True).clamp_min(1e-10)
+        cos = (current.float() * ema.float()).sum(dim=(-2, -1), keepdim=True) / (cur_norm * ema_norm)
+        candidate = current + blend * (ema.to(current.dtype) - current)
+        candidate = candidate * (cur_norm / candidate.float().norm(dim=(-2, -1), keepdim=True).clamp_min(1e-10)).to(candidate.dtype)
+        update = torch.where(cos >= min_cos, candidate, current)
+    ema.mul_(beta).add_(current.detach(), alpha=1.0 - beta)
+    return update
+
+def apply_muon_history(update: Tensor, state: dict, step: int, group: dict, enable_late_steps: bool = True) -> Tensor:
+    base_history_steps = int(group.get("muon_history_steps", 0) or 0)
+    late_history_steps = int(group.get("muon_history_steps_late", base_history_steps) or base_history_steps)
+    switch_step = int(group.get("muon_history_steps_switch_step", 0) or 0)
+    if not enable_late_steps:
+        late_history_steps = base_history_steps
+        switch_step = 0
+    adaptive_steps = bool(int(group.get("muon_history_adaptive_steps", 0) or 0))
+    late_enabled = switch_step > 0 and step >= switch_step and late_history_steps != base_history_steps
+    history_steps = late_history_steps if late_enabled and not adaptive_steps else base_history_steps
+    buffer_steps = max(base_history_steps, late_history_steps) if adaptive_steps and late_enabled else history_steps
+    if history_steps <= 0 or buffer_steps <= 0:
+        return update
+
+    if "muon_history_buffer" not in state or state["muon_history_buffer"].size(0) != buffer_steps:
+        old_history = state.get("muon_history_buffer")
+        new_history = torch.zeros((buffer_steps, *update.shape), dtype=update.dtype, device=update.device)
+        if old_history is not None:
+            keep = min(old_history.size(0), buffer_steps)
+            new_history[-keep:].copy_(old_history[-keep:].to(dtype=update.dtype, device=update.device))
+            if buffer_steps > keep and keep > 0:
+                new_history[:buffer_steps - keep].copy_(
+                    old_history[-keep].to(dtype=update.dtype, device=update.device)
+                )
+        state["muon_history_buffer"] = new_history
+    history = state["muon_history_buffer"]
+    current_g = update
+
+    if step > history_steps:
+        cur_norm = current_g.float().norm(dim=(-2, -1), keepdim=True).clamp_min(1e-10)
+        history_blend = _scheduled_history_blend(float(group.get("muon_history_blend", 0.0) or 0.0), step, group)
+
+        if history_blend > 0.0:
+            min_cos = float(group.get("muon_history_min_cos", 0.25))
+            late_min_cos = float(group.get("muon_history_min_cos_late", min_cos))
+            min_cos_start = int(group.get("muon_history_min_cos_decay_start_step", 0) or 0)
+            min_cos_end = int(group.get("muon_history_min_cos_decay_end_step", 0) or 0)
+            if min_cos_start > 0 and min_cos_end > min_cos_start:
+                if step >= min_cos_end:
+                    min_cos = late_min_cos
+                elif step > min_cos_start:
+                    frac = (step - min_cos_start) / max(1, min_cos_end - min_cos_start)
+                    min_cos = min_cos + (late_min_cos - min_cos) * frac
+
+            def build_candidate(n_steps: int):
+                num_points = n_steps + 1
+                x_mean = n_steps / 2.0
+                x_pred = n_steps + float(group.get("muon_history_lookahead", 1.0))
+                denom = sum((i - x_mean) ** 2 for i in range(num_points))
+                current_weight = 1.0 / num_points + (x_pred - x_mean) * (n_steps - x_mean) / denom
+                pred = current_g * current_weight
+                history_start = buffer_steps - n_steps
+                for i in range(n_steps):
+                    weight = 1.0 / num_points + (x_pred - x_mean) * (i - x_mean) / denom
+                    pred = pred + history[history_start + i].to(current_g.dtype) * weight
+
+                delta = pred - current_g
+                delta_norm = delta.float().norm(dim=(-2, -1), keepdim=True).clamp_min(1e-10)
+                max_delta = float(group.get("muon_history_max_delta", 0.25)) * cur_norm
+                delta = delta * torch.minimum(torch.ones_like(delta_norm), max_delta / delta_norm).to(delta.dtype)
+                clipped_delta_norm = delta.float().norm(dim=(-2, -1), keepdim=True).clamp_min(1e-10)
+                candidate = current_g + history_blend * delta
+                cand_norm = candidate.float().norm(dim=(-2, -1), keepdim=True).clamp_min(1e-10)
+                cos = (candidate.float() * current_g.float()).sum(dim=(-2, -1), keepdim=True) / (cand_norm * cur_norm)
+                aligned = cos >= min_cos
+                out = torch.where(aligned, candidate, current_g)
+                out = out * (cur_norm / out.float().norm(dim=(-2, -1), keepdim=True).clamp_min(1e-10)).to(out.dtype)
+                return out, cos, clipped_delta_norm
+
+            if adaptive_steps and late_enabled and late_history_steps > 0:
+                base_update, base_cos, base_delta_norm = build_candidate(base_history_steps)
+                late_update, late_cos, late_delta_norm = build_candidate(late_history_steps)
+                _diag_record_muon_history(step, f"base{base_history_steps}", base_cos, base_delta_norm, cur_norm, min_cos)
+                _diag_record_muon_history(step, f"late{late_history_steps}", late_cos, late_delta_norm, cur_norm, min_cos)
+                _diag_record_muon_history_pair(step, f"late{late_history_steps}_vs_base{base_history_steps}", late_update, base_update, cur_norm)
+                margin = float(group.get("muon_history_adapt_margin", 0.02))
+                delta_ratio = float(group.get("muon_history_adapt_delta_ratio", 1.25))
+                use_late = (late_cos >= min_cos) & (late_cos >= base_cos + margin) & (late_delta_norm <= base_delta_norm * delta_ratio)
+                update = torch.where(use_late, late_update, base_update)
+                if MUON_HISTORY_DIAG:
+                    _diag_record_muon_history(step, f"use_late{late_history_steps}", use_late.float(), torch.zeros_like(cur_norm), cur_norm, 0.5)
+            else:
+                update, active_cos, active_delta_norm = build_candidate(history_steps)
+                _diag_record_muon_history(step, f"active{history_steps}", active_cos, active_delta_norm, cur_norm, min_cos)
+                ramp_start = int(group.get("muon_history_steps_late_ramp_start_step", 0) or 0)
+                ramp_end = int(group.get("muon_history_steps_late_ramp_end_step", 0) or 0)
+                if late_enabled and base_history_steps > 0 and base_history_steps != history_steps and ramp_end > ramp_start:
+                    base_update, base_cos, base_delta_norm = build_candidate(base_history_steps)
+                    ramp = min(1.0, max(0.0, (step - ramp_start) / max(1, ramp_end - ramp_start)))
+                    update = base_update + (update - base_update) * ramp
+                    update = update * (cur_norm / update.float().norm(dim=(-2, -1), keepdim=True).clamp_min(1e-10)).to(update.dtype)
+                    _diag_record_muon_history(step, f"ramp{history_steps}", active_cos, active_delta_norm, cur_norm, min_cos)
+                    _diag_record_muon_history_pair(step, f"ramp{history_steps}_vs_base{base_history_steps}", update, base_update, cur_norm)
+                    if MUON_HISTORY_DIAG:
+                        _diag_record_muon_history(step, f"compare{base_history_steps}", base_cos, base_delta_norm, cur_norm, min_cos)
+                        _diag_record_muon_history_pair(step, f"active{history_steps}_vs_compare{base_history_steps}", update, base_update, cur_norm)
+                elif MUON_HISTORY_DIAG and late_enabled and base_history_steps > 0 and base_history_steps != history_steps:
+                    base_update, base_cos, base_delta_norm = build_candidate(base_history_steps)
+                    _diag_record_muon_history(step, f"compare{base_history_steps}", base_cos, base_delta_norm, cur_norm, min_cos)
+                    _diag_record_muon_history_pair(step, f"active{history_steps}_vs_compare{base_history_steps}", update, base_update, cur_norm)
+
+    if buffer_steps > 1:
+        history[:-1].copy_(history[1:].clone())
+    history[buffer_steps - 1].copy_(current_g)
+    return update
+
+def should_soap_param(name: str) -> bool:
+    is_mlp_fc = name.endswith(".mlp.fc.weight")
+    is_mlp_proj = name.endswith(".mlp.proj.weight")
+    is_attn_proj = name.endswith(".attn.proj.weight")
+    is_qkv = (
+        name.endswith(".attn.q.weight")
+        or name.endswith(".attn.k.weight")
+        or name.endswith(".attn.v.weight")
+    )
+    is_q = name.endswith(".attn.q.weight")
+    is_k = name.endswith(".attn.k.weight")
+    is_v = name.endswith(".attn.v.weight")
+    if SOAP_PARAM_MODE == "mlp_all":
+        return is_mlp_fc or is_mlp_proj
+    if SOAP_PARAM_MODE == "mlp_fc":
+        return is_mlp_fc
+    if SOAP_PARAM_MODE == "mlp_proj":
+        return is_mlp_proj
+    if SOAP_PARAM_MODE == "mlp_plus_attn_proj":
+        return is_mlp_fc or is_mlp_proj or is_attn_proj
+    if SOAP_PARAM_MODE == "mlp_plus_q":
+        return is_mlp_fc or is_mlp_proj or is_q
+    if SOAP_PARAM_MODE == "mlp_plus_k":
+        return is_mlp_fc or is_mlp_proj or is_k
+    if SOAP_PARAM_MODE == "mlp_plus_v":
+        return is_mlp_fc or is_mlp_proj or is_v
+    if SOAP_PARAM_MODE == "mlp_plus_qkv":
+        return is_mlp_fc or is_mlp_proj or is_qkv
+    if SOAP_PARAM_MODE == "all_hidden":
+        return is_mlp_fc or is_mlp_proj or is_attn_proj or is_qkv
+    raise ValueError(f"unknown SOAP_PARAM_MODE={SOAP_PARAM_MODE}")
+
+def is_attn_proj_param(name: str) -> bool:
+    return name.endswith(".attn.proj.weight")
+
+def is_attn_param(name: str) -> bool:
+    return (
+        name.endswith(".attn.q.weight")
+        or name.endswith(".attn.k.weight")
+        or name.endswith(".attn.v.weight")
+        or name.endswith(".attn.proj.weight")
+    )
+
+def is_v_param(name: str) -> bool:
+    return name.endswith(".attn.v.weight")
+
+def param_matches_spec(name: str, spec: str) -> bool:
+    keys = {part.strip() for part in spec.split(",") if part.strip()}
+    return (
+        ("q" in keys and name.endswith(".attn.q.weight"))
+        or ("k" in keys and name.endswith(".attn.k.weight"))
+        or ("v" in keys and name.endswith(".attn.v.weight"))
+        or ("attn_proj" in keys and name.endswith(".attn.proj.weight"))
+    )
+
+def block_index_from_name(name: str) -> int | None:
+    if not name.startswith("blocks."):
+        return None
+    parts = name.split(".")
+    if len(parts) < 2:
+        return None
+    try:
+        return int(parts[1])
+    except ValueError:
+        return None
+
+def muon_history_scope_matches(name: str, scope: str) -> bool:
+    block_idx = block_index_from_name(name)
+    if MUON_HISTORY_BLOCK_MIN >= 0 and (block_idx is None or block_idx < MUON_HISTORY_BLOCK_MIN):
+        return False
+    if MUON_HISTORY_BLOCK_MAX >= 0 and (block_idx is None or block_idx > MUON_HISTORY_BLOCK_MAX):
+        return False
+    scopes = {part.strip() for part in scope.split(",") if part.strip()}
+    if not scopes or "all" in scopes:
+        return True
+    is_v = name.endswith(".attn.v.weight")
+    is_o = name.endswith(".attn.proj.weight")
+    is_q = name.endswith(".attn.q.weight")
+    is_k = name.endswith(".attn.k.weight")
+    is_attn = is_q or is_k or is_v or is_o
+    is_mlp_fc = name.endswith(".mlp.fc.weight")
+    is_mlp_proj = name.endswith(".mlp.proj.weight")
+    is_mlp = is_mlp_fc or is_mlp_proj
+    return (
+        ("ov" in scopes and (is_v or is_o))
+        or ("non_ov" in scopes and not (is_v or is_o))
+        or ("attention" in scopes and is_attn)
+        or ("attn_non_ov" in scopes and (is_q or is_k))
+        or ("qk" in scopes and (is_q or is_k))
+        or ("mlp" in scopes and is_mlp)
+        or ("mlp_fc" in scopes and is_mlp_fc)
+        or ("mlp_proj" in scopes and is_mlp_proj)
+    )
+
+def tensor_cosine(a: Tensor, b: Tensor, eps: float = 1e-8) -> Tensor:
+    a_f, b_f = a.float(), b.float()
+    return (a_f * b_f).sum() / (a_f.norm() * b_f.norm()).clamp_min(eps)
+
+def trust_gate(raw: Tensor, soap: Tensor, grad: Tensor, eps: float = 1e-8) -> Tensor:
+    # SOAP is trusted when it still points with raw momentum and is at least as
+    # gradient-aligned as raw momentum. This catches stale whitening bases.
+    raw_grad = tensor_cosine(raw, grad, eps)
+    soap_grad = tensor_cosine(soap, grad, eps)
+    soap_raw = tensor_cosine(soap, raw, eps)
+
+    agree_gate = ((soap_raw - ATTN_TRUST_MIN_AGREE) / (1 - ATTN_TRUST_MIN_AGREE)).clamp(0, 1)
+    denom = (raw_grad - ATTN_TRUST_MIN_GRAD_ALIGN).clamp_min(eps)
+    grad_gate = ((soap_grad - ATTN_TRUST_MIN_GRAD_ALIGN) / denom).clamp(0, 1)
+    gate = (agree_gate * grad_gate).clamp(0, 1)
+    if ATTN_TRUST_POWER != 1.0:
+        gate = gate.pow(ATTN_TRUST_POWER)
+    return gate
+
+def early_trust_floor_for_step(step: int) -> float:
+    if ATTN_TRUST_FLOOR_FADE_END_STEP <= ATTN_TRUST_FLOOR_END_STEP:
+        return 0.0 if step >= ATTN_TRUST_FLOOR_FADE_END_STEP else ATTN_EARLY_TRUST_FLOOR
+    if step < ATTN_TRUST_FLOOR_END_STEP:
+        return ATTN_EARLY_TRUST_FLOOR
+    if step >= ATTN_TRUST_FLOOR_FADE_END_STEP:
+        return 0.0
+    return ATTN_EARLY_TRUST_FLOOR * (
+        ATTN_TRUST_FLOOR_FADE_END_STEP - step
+    ) / (ATTN_TRUST_FLOOR_FADE_END_STEP - ATTN_TRUST_FLOOR_END_STEP)
+
+def bounded_trust_gate(gate: Tensor, step: int) -> Tensor:
+    floor = early_trust_floor_for_step(step)
+    cap = ATTN_EARLY_TRUST_CAP if step < ATTN_TRUST_FLOOR_FADE_END_STEP else 1.0
+    return gate.clamp(min=floor, max=cap)
+
+def apply_attention_trust_history(gate: Tensor, state: dict, step: int) -> Tensor:
+    if ATTN_TRUST_HISTORY_BETA <= 0.0 or ATTN_TRUST_HISTORY_BLEND <= 0.0:
+        return gate
+    if step < ATTN_TRUST_HISTORY_START_STEP or step > ATTN_TRUST_HISTORY_END_STEP:
+        return gate
+    if "attn_trust_gate_ema" not in state:
+        state["attn_trust_gate_ema"] = gate.detach().float().clone()
+        return gate
+    ema = state["attn_trust_gate_ema"]
+    ema.mul_(ATTN_TRUST_HISTORY_BETA).add_(gate.detach().float(), alpha=1.0 - ATTN_TRUST_HISTORY_BETA)
+    smoothed = gate.float() + ATTN_TRUST_HISTORY_BLEND * (ema - gate.float())
+    return smoothed.clamp(0.0, 1.0).to(gate.dtype)
+
+def attention_soap_blend_for_step(step: int) -> float:
+    if step < ATTN_SOAP_FADE_START_STEP:
+        return 1.0
+    if step >= ATTN_SOAP_FADE_END_STEP:
+        return 0.0
+    if ATTN_SOAP_FADE_END_STEP <= ATTN_SOAP_FADE_START_STEP:
+        return 0.0
+    return (
+        ATTN_SOAP_FADE_END_STEP - step
+    ) / (ATTN_SOAP_FADE_END_STEP - ATTN_SOAP_FADE_START_STEP)
+
+def norm_preserving_blend(raw: Tensor, soap: Tensor, gate: Tensor, eps: float = 1e-8) -> Tensor:
+    blended = raw + (soap - raw) * gate.to(raw.dtype)
+    raw_norm = gram_frobenius_norm_estimate(raw, eps=eps)
+    blended_norm = gram_frobenius_norm_estimate(blended, eps=eps)
+    return (blended * (raw_norm / blended_norm).to(blended.dtype)).to(raw.dtype)
+
+def scale_radial_update(update: Tensor, param: Tensor, eps: float = 1e-12) -> Tensor:
+    update_f = update.float()
+    param_f = param.float()
+    denom = (param_f * param_f).sum().clamp_min(eps)
+    coeff = (update_f * param_f).sum() / denom
+    radial = coeff * param_f
+    tangential = update_f - radial
+    # p.add_(update, alpha=-lr), so actual movement is -update.
+    # Outward movement means (-update) is aligned with p, i.e. coeff < 0.
+    radial_scale = torch.where(
+        coeff < 0,
+        update_f.new_tensor(RADIAL_OUTWARD_SCALE),
+        update_f.new_tensor(RADIAL_INWARD_SCALE),
+    )
+    return (tangential + radial_scale * radial).to(update.dtype)
+
+def scale_radial_update_with_history(update: Tensor, param: Tensor, state: dict, step: int, eps: float = 1e-12) -> Tensor:
+    if RADIAL_HISTORY_BETA <= 0.0 or RADIAL_HISTORY_BLEND <= 0.0:
+        return scale_radial_update(update, param, eps=eps)
+    update_f = update.float()
+    param_f = param.float()
+    denom = (param_f * param_f).sum().clamp_min(eps)
+    coeff = (update_f * param_f).sum() / denom
+    if step < RADIAL_HISTORY_START_STEP or step > RADIAL_HISTORY_END_STEP:
+        coeff_eff = coeff
+    else:
+        if "radial_coeff_ema" not in state:
+            state["radial_coeff_ema"] = coeff.detach().float().clone()
+        ema = state["radial_coeff_ema"]
+        ema.mul_(RADIAL_HISTORY_BETA).add_(coeff.detach().float(), alpha=1.0 - RADIAL_HISTORY_BETA)
+        coeff_eff = coeff + RADIAL_HISTORY_BLEND * (ema - coeff)
+    radial_current = coeff * param_f
+    tangential = update_f - radial_current
+    radial_eff = coeff_eff * param_f
+    radial_scale = torch.where(
+        coeff_eff < 0,
+        update_f.new_tensor(RADIAL_OUTWARD_SCALE),
+        update_f.new_tensor(RADIAL_INWARD_SCALE),
+    )
+    return (tangential + radial_scale * radial_eff).to(update.dtype)
+
+def target_radius_after_update(param: Tensor, update: Tensor, lr: float, eps: float = 1e-8) -> Tensor:
+    param_f = param.float()
+    update_f = update.float()
+    before_norm = param_f.norm().clamp_min(eps)
+    # Use only the radial component's first-order radius change as the intended
+    # radius change; the post-step rescale below removes finite tangent drift.
+    radial_delta = -lr * (update_f * param_f).sum() / before_norm
+    return (before_norm + radial_delta).clamp_min(eps)
+
+def rescale_to_radius(param: Tensor, target_norm: Tensor, eps: float = 1e-8):
+    after_norm = param.float().norm().clamp_min(eps)
+    param.mul_((target_norm / after_norm).to(param.dtype))
+
+def soap_eigenbasis(mat: Tensor) -> Tensor:
+    try:
+        _, q = torch.linalg.eigh(mat + 1e-30 * torch.eye(mat.size(0), device=mat.device))
+    except RuntimeError:
+        _, q = torch.linalg.eigh(mat.double() + 1e-30 * torch.eye(mat.size(0), device=mat.device))
+        q = q.float()
+    return torch.flip(q, [1])
+
+def soap_basis_qr(row_gg, col_gg, q_row, q_col, exp_avg_sq):
+    row_eig = torch.diag(q_row.T @ row_gg @ q_row)
+    row_sort = torch.argsort(row_eig, descending=True)
+    q_row = q_row[:, row_sort]
+    exp_avg_sq = exp_avg_sq.index_select(0, row_sort)
+    q_row, _ = torch.linalg.qr(row_gg @ q_row)
+
+    col_eig = torch.diag(q_col.T @ col_gg @ q_col)
+    col_sort = torch.argsort(col_eig, descending=True)
+    q_col = q_col[:, col_sort]
+    exp_avg_sq = exp_avg_sq.index_select(1, col_sort)
+    q_col, _ = torch.linalg.qr(col_gg @ q_col)
+    return q_row, q_col, exp_avg_sq
+
+def soap_precondition_momentum(update, state, beta2=SOAP_BETA2, eps=1e-8,
+                               blend=SOAP_BLEND, denom_floor_ratio=0.0):
+    update_f = update.float()
+    if state["q_row"] is None:
+        return update
+    q_row, q_col = state["q_row"], state["q_col"]
+    projected = q_row.T @ update_f @ q_col
+    state["exp_avg_sq"].mul_(beta2).add_(projected.square(), alpha=1 - beta2)
+    denom = state["exp_avg_sq"].clamp_min(eps * eps).pow(SOAP_DENOM_POWER)
+    if denom_floor_ratio > 0:
+        denom_floor = denom.float().square().mean().sqrt().mul(denom_floor_ratio).clamp_min(eps)
+        denom = denom.clamp_min(denom_floor.to(denom.dtype))
+    precond = q_row @ (projected / denom) @ q_col.T
+    if blend != 1.0:
+        precond = blend * precond + (1 - blend) * update_f
+    precond.mul_(gram_frobenius_norm_estimate(update_f, eps=eps) / gram_frobenius_norm_estimate(precond, eps=eps))
+    return precond.to(update.dtype)
+
+def soap_update_preconditioner(grad, state, shampoo_beta=SOAP_BETA2, precondition_frequency=SOAP_PRECONDITION_FREQUENCY):
+    grad_f = grad.float()
+    state["row_gg"].lerp_(grad_f @ grad_f.T, 1 - shampoo_beta)
+    state["col_gg"].lerp_(grad_f.T @ grad_f, 1 - shampoo_beta)
+    if state["q_row"] is None:
+        state["q_row"] = soap_eigenbasis(state["row_gg"])
+        state["q_col"] = soap_eigenbasis(state["col_gg"])
+    elif state["soap_step"] > 0 and state["soap_step"] % precondition_frequency == 0:
+        state["q_row"], state["q_col"], state["exp_avg_sq"] = soap_basis_qr(
+            state["row_gg"], state["col_gg"], state["q_row"], state["q_col"], state["exp_avg_sq"]
+        )
+    state["soap_step"] += 1
+
+def _linear_ramp(step: int, start_step: int, end_step: int) -> float:
+    if end_step <= start_step:
+        return 1.0 if step >= end_step else 0.0
+    return min(1.0, max(0.0, (step - start_step) / (end_step - start_step)))
+
+def contra_coeff_for_step(step: int) -> float:
+    contra_to_normal = _linear_ramp(step, CONTRA_HOLD_END_STEP, CONTRA_TO_NORMAL_END_STEP)
+    return CONTRA_MUON_COEFF * (1.0 - contra_to_normal)
+
+def soft_blend_for_step(step: int) -> float:
+    return min(SOFT_MUON_CEIL, _linear_ramp(step, NORMAL_TO_SOFT_START_STEP, NORMAL_TO_SOFT_END_STEP))
+
+def muon_update(update, second_moment, step, beta2=NOR_BETA2, use_contra=True, use_soft=True, state=None):
+    normalized_grad = scale_to_unit_operator_norm(update.clone())
+    if use_contra and state is not None and CONTRA_HISTORY_STEPS > 0 and step >= CONTRA_HISTORY_START_STEP and step <= CONTRA_HISTORY_END_STEP:
+        normalized_grad = apply_direction_history(
+            normalized_grad, state, step,
+            key="contra_history",
+            history_steps=CONTRA_HISTORY_STEPS,
+            blend=CONTRA_HISTORY_BLEND,
+            lookahead=CONTRA_HISTORY_LOOKAHEAD,
+            min_cos=CONTRA_HISTORY_MIN_COS,
+            max_delta=CONTRA_HISTORY_MAX_DELTA,
+            decay_start=CONTRA_HISTORY_END_STEP,
+            decay_end=CONTRA_HISTORY_END_STEP + 1,
+            final_mult=1.0,
+        )
+        normalized_grad = scale_to_unit_operator_norm(normalized_grad)
+    ns_update = zeropower_via_newtonschulz5(update)
+    update_norm_estimate = gram_frobenius_norm_estimate(ns_update)
+
+    contra_coeff = contra_coeff_for_step(step) if use_contra else 0.0
+    contra_update = ns_update + contra_coeff * normalized_grad
+    contra_update = contra_update * update_norm_estimate / gram_frobenius_norm_estimate(contra_update)
+    if use_soft:
+        soft_update = soft_via_newtonschulz5(update, SOFT_MUON_P, SOFT_MUON_SCALE, SOFT_MUON_INPUT_NORM)
+        soft_update = soft_update * update_norm_estimate / gram_frobenius_norm_estimate(soft_update)
+        blend = soft_blend_for_step(step)
+    else:
+        soft_update = contra_update
+        blend = 0.0
+    update = contra_update + (soft_update - contra_update) * blend
+    update = update * update_norm_estimate / gram_frobenius_norm_estimate(update)
+    update *= max(1, update.size(-2) / update.size(-1))**0.5
+    # Per-row variance (or per-col if matrix is wide). Keep along the longer dim.
+    if update.size(-2) >= update.size(-1):
+        per_row_var = (update * update).mean(dim=-1, keepdim=True)  # shape (..., m, 1)
+    else:
+        per_row_var = (update * update).mean(dim=-2, keepdim=True)  # shape (..., 1, n)
+    second_moment.lerp_(per_row_var.float(), 1 - beta2)
+    vnorm = gram_frobenius_norm_estimate(update)
+    update = update * second_moment.clamp_min(1e-10).rsqrt().to(update.dtype)
+    vnorm_new = gram_frobenius_norm_estimate(update)
+    update = update * (vnorm / vnorm_new)
+    return update
+
+def circuit_muon(uV, uO, WV, WO, head_dim=HEAD_DIM, lam=CIRCUIT_OV_DAMPING):
+    """Circuit-Muon for one OV pair (attn.v, attn.proj).
+
+    Approximates each head's Gram root as isotropic C = c*I with c^2 = ||W_h||^2/hd,
+    so the partner inverse-Gram-root collapses to one Frobenius-norm scalar
+    s = 1/sqrt(c^2 + lam). Newton-Schulz msign is scale invariant, so the partner
+    pre-whiten cancels and only post-whitening + gauge rebalance remain:
+      (a) per-head post-whiten: delta_V *= s_O, delta_O *= s_V
+      (b) restore each leg's pre-scale Frobenius norm — preserves the per-head
+          anisotropy of s while letting PR309's u/w-floor + rescale-to-radius set
+          the absolute step magnitude downstream
+      (c) trace-only gauge: x_h = (<W_V, dV> - <W_O, dO>) / (||W_V||^2 + ||W_O||^2 + 2*hd*lam)
+          dV -= x_h * W_V,   dO += x_h * W_O   (per head; conserves the per-head
+          trace gap ||W_V_h||^2 - ||W_O_h||^2)
+
+    WV shape (n_heads*hd, dim) with heads on rows; WO shape (dim, n_heads*hd) with
+    heads on columns. uV/uO have matching shapes.
+    """
+    hd = head_dim
+    H = WV.size(0) // hd
+    WVh = WV.view(H, hd, WV.size(1)).float()             # (H, hd, dim)
+    WOh = WO.view(WO.size(0), H, hd).float()             # (dim, H, hd)
+    uVh = uV.view(H, hd, uV.size(1))
+    uOh = uO.view(uO.size(0), H, hd)
+    sqV = WVh.pow(2).sum(dim=(1, 2))                     # ||W_V_h||^2, (H,)
+    sqO = WOh.pow(2).sum(dim=(0, 2))                     # ||W_O_h||^2, (H,)
+    s_V = (sqV / hd + lam).clamp_min(1e-12).rsqrt()      # scalar C_V^-1, (H,)
+    s_O = (sqO / hd + lam).clamp_min(1e-12).rsqrt()      # scalar C_O^-1, (H,)
+    # (a)+(b): partner post-whiten then renorm to pre-scale Frobenius norm
+    nV, nO = uVh.float().norm(), uOh.float().norm()
+    uVh = uVh * s_O[:, None, None].to(uVh.dtype)
+    uOh = uOh * s_V[None, :, None].to(uOh.dtype)
+    uVh = uVh * (nV / uVh.float().norm().clamp_min(1e-12)).to(uVh.dtype)
+    uOh = uOh * (nO / uOh.float().norm().clamp_min(1e-12)).to(uOh.dtype)
+    # (c): trace-only gauge rebalance, per head
+    aV = (WVh * uVh.float()).sum(dim=(1, 2))             # <W_V_h, dV_h>
+    aO = (WOh * uOh.float()).sum(dim=(0, 2))             # <W_O_h, dO_h>
+    x = (aV - aO) / (sqV + sqO + 2.0 * hd * lam).clamp_min(1e-12)
+    uVh = uVh - x[:, None, None].to(uVh.dtype) * WVh.to(uVh.dtype)
+    uOh = uOh + x[None, :, None].to(uOh.dtype) * WOh.to(uOh.dtype)
+    return uVh.reshape_as(uV), uOh.reshape_as(uO)
+
+
+class Muon(torch.optim.Optimizer):
+    def __init__(self, named_params, lr=0.02, weight_decay=0, mu=0.95, muon_history=None):
+        assert isinstance(named_params, list) and len(named_params) >= 1
+        self.soap_params = {p for n, p in named_params if should_soap_param(n)}
+        self.attn_soap_params = {p for n, p in named_params if should_soap_param(n) and is_attn_param(n)}
+        self.attn_proj_soap_params = {p for n, p in named_params if should_soap_param(n) and is_attn_proj_param(n)}
+        self.v_params = {p for n, p in named_params if is_v_param(n)}
+        self.muon_history_params = {p for n, p in named_params if muon_history_scope_matches(n, MUON_HISTORY_SCOPE)}
+        self.muon_history_late_params = {p for n, p in named_params if muon_history_scope_matches(n, MUON_HISTORY_STEPS_LATE_SCOPE)}
+        self.no_contra_params = {p for n, p in named_params if param_matches_spec(n, NO_CONTRA_PARAM)}
+        self.no_soft_params = {p for n, p in named_params if param_matches_spec(n, NO_SOFTMUON_PARAM)}
+        self.step_count = 0
+        params = sorted([p for _, p in named_params], key=lambda x: x.size(), reverse=True)
+        # Circuit-Muon: pair each attn.v with its block's attn.proj for a coupled
+        # update; these params are processed in _circuit_muon_step and skipped in
+        # the main round-robin below.
+        by_name = dict(named_params)
+        self.ov_pairs = []
+        self.ov_params = set()
+        for n, p in named_params:
+            if n.endswith(".attn.v.weight"):
+                o = by_name.get(n[:-len(".attn.v.weight")] + ".attn.proj.weight")
+                if o is not None:
+                    self.ov_pairs.append((p, o))
+                    self.ov_params.update({p, o})
+        defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu)
+        if muon_history:
+            defaults.update(muon_history)
+        super().__init__(params, defaults)
+
+    def _ensure_state(self, p):
+        state = self.state[p]
+        if len(state) == 0:
+            state["momentum"] = torch.zeros_like(p)
+            if p in self.soap_params:
+                state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
+                state["row_gg"] = torch.zeros(p.size(0), p.size(0), dtype=torch.float32, device=p.device)
+                state["col_gg"] = torch.zeros(p.size(1), p.size(1), dtype=torch.float32, device=p.device)
+                state["q_row"] = None
+                state["q_col"] = None
+                state["soap_step"] = 0
+            if p.size(-2) >= p.size(-1):
+                state["second_moment"] = torch.zeros((*p.shape[:-1], 1),
+                    dtype=torch.float32, device=p.device)
+            else:
+                state["second_moment"] = torch.zeros((*p.shape[:-2], 1, p.shape[-1]),
+                    dtype=torch.float32, device=p.device)
+
+    def _direction(self, p, group):
+        """Momentum -> SOAP -> muon_update; returns the raw (pre-radial) update.
+        Mirrors the per-param body in step() — used by _circuit_muon_step so the
+        coupled V/O update goes through exactly the same direction pipeline."""
+        state = self.state[p]
+        grad = p.grad
+        state["momentum"].lerp_(grad, 1 - group["mu"])
+        momentum_update = grad.lerp(state["momentum"], group["mu"])
+        is_attn_soap = p in self.attn_soap_params
+        use_soap = p in self.soap_params
+        if use_soap and SOAP_UPDATE_BEFORE_USE:
+            soap_update_preconditioner(grad, state)
+        if use_soap:
+            if is_attn_soap:
+                soap_blend = V_SOAP_BLEND if p in self.v_params else ATTN_SOAP_BLEND
+                if p in self.v_params and V_SOAP_BLEND_RAMP_END_STEP > 0:
+                    soap_blend *= _linear_ramp(self.step_count, 0, V_SOAP_BLEND_RAMP_END_STEP)
+                soap_update = soap_precondition_momentum(
+                    momentum_update, state, blend=soap_blend,
+                    denom_floor_ratio=ATTN_SOAP_DENOM_FLOOR
+                )
+                if p in self.attn_proj_soap_params:
+                    gate = bounded_trust_gate(
+                        trust_gate(momentum_update, soap_update, grad),
+                        self.step_count
+                    )
+                else:
+                    gate = torch.ones((), dtype=torch.float32, device=p.device)
+                gate = gate * attention_soap_blend_for_step(self.step_count)
+                if p in self.attn_proj_soap_params:
+                    gate = apply_attention_trust_history(gate, state, self.step_count)
+                momentum_update = norm_preserving_blend(momentum_update, soap_update, gate)
+            else:
+                momentum_update = soap_precondition_momentum(momentum_update, state, blend=SOAP_BLEND)
+        if use_soap and SOAP_HISTORY_STEPS > 0:
+            momentum_update = apply_direction_history(
+                momentum_update, state, self.step_count,
+                key="soap_history",
+                history_steps=SOAP_HISTORY_STEPS,
+                blend=SOAP_HISTORY_BLEND,
+                lookahead=SOAP_HISTORY_LOOKAHEAD,
+                min_cos=SOAP_HISTORY_MIN_COS,
+                max_delta=SOAP_HISTORY_MAX_DELTA,
+                decay_start=SOAP_HISTORY_DECAY_START_STEP,
+                decay_end=SOAP_HISTORY_DECAY_END_STEP,
+                final_mult=SOAP_HISTORY_FINAL_BLEND_MULT,
+            )
+        if p in self.muon_history_params:
+            momentum_update = apply_muon_history(
+                momentum_update, state, self.step_count, group,
+                enable_late_steps=p in self.muon_history_late_params,
+            )
+        return muon_update(
+            momentum_update,
+            state["second_moment"],
+            self.step_count,
+            use_contra=p not in self.no_contra_params,
+            use_soft=p not in self.no_soft_params,
+            state=state,
+        )
+
+    def _finish(self, p, group, update):
+        """Radial scale -> u/w floor -> apply -> radius correction -> SOAP refresh."""
+        use_soap = p in self.soap_params
+        if MUON_OUTPUT_HISTORY_STEPS > 0:
+            update = apply_direction_history(
+                update, self.state[p], self.step_count,
+                key="muon_output_history",
+                history_steps=MUON_OUTPUT_HISTORY_STEPS,
+                blend=MUON_OUTPUT_HISTORY_BLEND,
+                lookahead=MUON_OUTPUT_HISTORY_LOOKAHEAD,
+                min_cos=MUON_OUTPUT_HISTORY_MIN_COS,
+                max_delta=MUON_OUTPUT_HISTORY_MAX_DELTA,
+                decay_start=MUON_OUTPUT_HISTORY_DECAY_START_STEP,
+                decay_end=MUON_OUTPUT_HISTORY_DECAY_END_STEP,
+                final_mult=MUON_OUTPUT_HISTORY_FINAL_BLEND_MULT,
+            )
+        if MUON_OUTPUT_EMA_BETA > 0.0 and MUON_OUTPUT_EMA_BLEND > 0.0:
+            update = apply_direction_ema_blend(
+                update, self.state[p], self.step_count,
+                key="muon_output",
+                beta=MUON_OUTPUT_EMA_BETA,
+                blend=MUON_OUTPUT_EMA_BLEND,
+                min_cos=MUON_OUTPUT_EMA_MIN_COS,
+                start_step=MUON_OUTPUT_EMA_START_STEP,
+                end_step=MUON_OUTPUT_EMA_END_STEP,
+            )
+        update = scale_radial_update_with_history(update, p, self.state[p], self.step_count)
+        p_fro = p.float().norm().clamp_min(1e-8)
+        u_fro = update.float().norm().clamp_min(1e-8)
+        cur_uw = u_fro / p_fro
+        target_uw = SOAP_TARGET_UW if use_soap else NONSOAP_TARGET_UW
+        scale = torch.where(cur_uw < target_uw, target_uw * p_fro / u_fro, torch.ones_like(p_fro))
+        update = update * scale.to(update.dtype)
+        target_radius = target_radius_after_update(p, update, group["lr"])
+        p.add_(update, alpha=-group["lr"])
+        rescale_to_radius(p, target_radius)
+        if use_soap and not SOAP_UPDATE_BEFORE_USE:
+            soap_update_preconditioner(p.grad, self.state[p])
+
+    @torch.no_grad()
+    def _circuit_muon_step(self, group):
+        """Circuit-Muon coupled update for each (attn.v, attn.proj) pair.
+        Computed redundantly on every rank — params are replicated and grads are
+        all-reduced, so the two legs stay in sync without a separate all_gather."""
+        for v, o in self.ov_pairs:
+            self._ensure_state(v); self._ensure_state(o)
+            uV = self._direction(v, group)
+            uO = self._direction(o, group)
+            uV, uO = circuit_muon(uV, uO, v.data, o.data)
+            if CIRCUIT_HISTORY_STEPS > 0 and self.step_count >= CIRCUIT_HISTORY_START_STEP:
+                circuit_scopes = {part.strip() for part in CIRCUIT_HISTORY_SCOPE.split(",") if part.strip()}
+                circuit_both = not circuit_scopes or "both" in circuit_scopes or "all" in circuit_scopes
+                uV = apply_direction_history(
+                    uV, self.state[v], self.step_count,
+                    key="circuit_history",
+                    history_steps=CIRCUIT_HISTORY_STEPS,
+                    blend=CIRCUIT_HISTORY_BLEND,
+                    lookahead=CIRCUIT_HISTORY_LOOKAHEAD,
+                    min_cos=CIRCUIT_HISTORY_MIN_COS,
+                    max_delta=CIRCUIT_HISTORY_MAX_DELTA,
+                    decay_start=CIRCUIT_HISTORY_DECAY_START_STEP,
+                    decay_end=CIRCUIT_HISTORY_DECAY_END_STEP,
+                    final_mult=CIRCUIT_HISTORY_FINAL_BLEND_MULT,
+                    agree_shrink=CIRCUIT_HISTORY_AGREE_SHRINK,
+                    agree_min_scale=CIRCUIT_HISTORY_AGREE_MIN_SCALE,
+                ) if circuit_both or "v" in circuit_scopes else uV
+                uO = apply_direction_history(
+                    uO, self.state[o], self.step_count,
+                    key="circuit_history",
+                    history_steps=CIRCUIT_HISTORY_STEPS,
+                    blend=CIRCUIT_HISTORY_BLEND,
+                    lookahead=CIRCUIT_HISTORY_LOOKAHEAD,
+                    min_cos=CIRCUIT_HISTORY_MIN_COS,
+                    max_delta=CIRCUIT_HISTORY_MAX_DELTA,
+                    decay_start=CIRCUIT_HISTORY_DECAY_START_STEP,
+                    decay_end=CIRCUIT_HISTORY_DECAY_END_STEP,
+                    final_mult=CIRCUIT_HISTORY_FINAL_BLEND_MULT,
+                    agree_shrink=CIRCUIT_HISTORY_AGREE_SHRINK,
+                    agree_min_scale=CIRCUIT_HISTORY_AGREE_MIN_SCALE,
+                ) if circuit_both or "o" in circuit_scopes or "proj" in circuit_scopes else uO
+            self._finish(v, group, uV)
+            self._finish(o, group, uO)
+
+    @torch.no_grad()
+    def step(self):
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        for group in self.param_groups:
+            self._circuit_muon_step(group)   # coupled update for OV pairs
+            params = [p for p in group["params"] if p not in self.ov_params]   # skip them below
+            params_pad = params + [torch.empty_like(params[-1])] * (world_size - len(params) % world_size)
+            for base_i in range(0, len(params), world_size):
+                if base_i + rank < len(params):
+                    p = params[base_i + rank]
+                    state = self.state[p]
+                    if len(state) == 0:
+                        state["momentum"] = torch.zeros_like(p)
+                        if p in self.soap_params:
+                            state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
+                            state["row_gg"] = torch.zeros(p.size(0), p.size(0), dtype=torch.float32, device=p.device)
+                            state["col_gg"] = torch.zeros(p.size(1), p.size(1), dtype=torch.float32, device=p.device)
+                            state["q_row"] = None
+                            state["q_col"] = None
+                            state["soap_step"] = 0
+                        # Second-moment buffer matches per-row-or-col shape.
+                        if p.size(-2) >= p.size(-1):
+                            state["second_moment"] = torch.zeros((*p.shape[:-1], 1),
+                                dtype=torch.float32, device=p.device)
+                        else:
+                            state["second_moment"] = torch.zeros((*p.shape[:-2], 1, p.shape[-1]),
+                                dtype=torch.float32, device=p.device)
+                    grad = p.grad
+                    state["momentum"].lerp_(grad, 1 - group["mu"])
+                    momentum_update = grad.lerp(state["momentum"], group["mu"])
+                    is_attn_soap = p in self.attn_soap_params
+                    use_soap = p in self.soap_params
+                    if use_soap and SOAP_UPDATE_BEFORE_USE:
+                        soap_update_preconditioner(grad, state)
+                    if use_soap:
+                        if is_attn_soap:
+                            soap_blend = V_SOAP_BLEND if p in self.v_params else ATTN_SOAP_BLEND
+                            if p in self.v_params and V_SOAP_BLEND_RAMP_END_STEP > 0:
+                                soap_blend *= _linear_ramp(self.step_count, 0, V_SOAP_BLEND_RAMP_END_STEP)
+                            soap_update = soap_precondition_momentum(
+                                momentum_update, state, blend=soap_blend,
+                                denom_floor_ratio=ATTN_SOAP_DENOM_FLOOR
+                            )
+                            if p in self.attn_proj_soap_params:
+                                gate = bounded_trust_gate(
+                                    trust_gate(momentum_update, soap_update, grad),
+                                    self.step_count
+                                )
+                            else:
+                                gate = torch.ones((), dtype=torch.float32, device=p.device)
+                            gate = gate * attention_soap_blend_for_step(self.step_count)
+                            if p in self.attn_proj_soap_params:
+                                gate = apply_attention_trust_history(gate, state, self.step_count)
+                            momentum_update = norm_preserving_blend(momentum_update, soap_update, gate)
+                        else:
+                            momentum_update = soap_precondition_momentum(momentum_update, state, blend=SOAP_BLEND)
+                    if use_soap and SOAP_HISTORY_STEPS > 0:
+                        momentum_update = apply_direction_history(
+                            momentum_update, state, self.step_count,
+                            key="soap_history",
+                            history_steps=SOAP_HISTORY_STEPS,
+                            blend=SOAP_HISTORY_BLEND,
+                            lookahead=SOAP_HISTORY_LOOKAHEAD,
+                            min_cos=SOAP_HISTORY_MIN_COS,
+                            max_delta=SOAP_HISTORY_MAX_DELTA,
+                            decay_start=SOAP_HISTORY_DECAY_START_STEP,
+                            decay_end=SOAP_HISTORY_DECAY_END_STEP,
+                            final_mult=SOAP_HISTORY_FINAL_BLEND_MULT,
+                        )
+                    if p in self.muon_history_params:
+                        momentum_update = apply_muon_history(
+                            momentum_update, state, self.step_count, group,
+                            enable_late_steps=p in self.muon_history_late_params,
+                        )
+                    update = muon_update(
+                        momentum_update,
+                        state["second_moment"],
+                        self.step_count,
+                        use_contra=p not in self.no_contra_params,
+                        use_soft=p not in self.no_soft_params,
+                        state=state,
+                    )
+                    if MUON_OUTPUT_HISTORY_STEPS > 0:
+                        update = apply_direction_history(
+                            update, state, self.step_count,
+                            key="muon_output_history",
+                            history_steps=MUON_OUTPUT_HISTORY_STEPS,
+                            blend=MUON_OUTPUT_HISTORY_BLEND,
+                            lookahead=MUON_OUTPUT_HISTORY_LOOKAHEAD,
+                            min_cos=MUON_OUTPUT_HISTORY_MIN_COS,
+                            max_delta=MUON_OUTPUT_HISTORY_MAX_DELTA,
+                            decay_start=MUON_OUTPUT_HISTORY_DECAY_START_STEP,
+                            decay_end=MUON_OUTPUT_HISTORY_DECAY_END_STEP,
+                            final_mult=MUON_OUTPUT_HISTORY_FINAL_BLEND_MULT,
+                        )
+                    if MUON_OUTPUT_EMA_BETA > 0.0 and MUON_OUTPUT_EMA_BLEND > 0.0:
+                        update = apply_direction_ema_blend(
+                            update, state, self.step_count,
+                            key="muon_output",
+                            beta=MUON_OUTPUT_EMA_BETA,
+                            blend=MUON_OUTPUT_EMA_BLEND,
+                            min_cos=MUON_OUTPUT_EMA_MIN_COS,
+                            start_step=MUON_OUTPUT_EMA_START_STEP,
+                            end_step=MUON_OUTPUT_EMA_END_STEP,
+                        )
+                    update = scale_radial_update_with_history(update, p, state, self.step_count)
+                    # u/w-floor. SOAP and non-SOAP params can use different floors.
+                    p_fro = p.float().norm().clamp_min(1e-8)
+                    u_fro = update.float().norm().clamp_min(1e-8)
+                    cur_uw = u_fro / p_fro
+                    target_uw = SOAP_TARGET_UW if use_soap else NONSOAP_TARGET_UW
+                    scale = torch.where(cur_uw < target_uw, target_uw * p_fro / u_fro, torch.ones_like(p_fro))
+                    update = update * scale.to(update.dtype)
+                    target_radius = target_radius_after_update(p, update, group["lr"])
+                    # WD set to 0 — u/w target replaces wd's role (smaller updates as p grows).
+                    p.add_(update, alpha=-group["lr"])
+                    rescale_to_radius(p, target_radius)
+                    if use_soap and not SOAP_UPDATE_BEFORE_USE:
+                        soap_update_preconditioner(grad, state)
+                dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
+        self.step_count += 1
+
+
+class EMA_Nesterov(torch.optim.Optimizer):
+    def __init__(self, params, inner_optimizer, lookahead_stepsize=0, use_scheduled_lookahead_stepsize=True, lookahead_ema=0.9, prefill_steps=0, rest_steps=0):
+        if lookahead_stepsize < 0.0:
+            raise ValueError("Invalid momentum value: {}".format(lookahead_stepsize))
+
+        super(EMA_Nesterov, self).__init__(params, {})
+        self.inner_optimizer = inner_optimizer
+        self.use_scheduled_lookahead_stepsize = use_scheduled_lookahead_stepsize
+        self.lookahead_stepsize = lookahead_stepsize
+        self.lookahead_ema = lookahead_ema
+        self.prefill_steps = prefill_steps
+        self.rest_steps = rest_steps
+        self.it = 0
+        self.lookahead_status = False
+        self.current_lookahead_stepsize = 0
+        self.initialize_buffers()
+
+    def __setstate__(self, state):
+        super(EMA_Nesterov, self).__setstate__(state)
+
+    @torch.no_grad()
+    def initialize_buffers(self):
+        for group in self.param_groups:
+            for p in group['params']:
+                param_state = self.state[p]
+                if 'prev_params' not in param_state:
+                    param_state['prev_params'] = (p.clone(), self.it)
+
+                if 'lookahead_buffer' not in param_state:
+                    param_state['lookahead_buffer'] = (torch.zeros_like(p), -1)
+    
+    def get_lr_lambda(self):
+        if isinstance(self.inner_optimizer, list):
+            lr_lambda = self.inner_optimizer[0].param_groups[0]["lr"] / self.inner_optimizer[0].param_groups[0]["initial_lr"]
+        else:
+            lr_lambda = self.inner_optimizer.param_groups[0]["lr"] / self.inner_optimizer.param_groups[0]["initial_lr"]
+        return lr_lambda
+
+    @torch.no_grad()
+    def lookahead_step(self):
+        """Performs nesterov's lookahead."""
+        if self.use_scheduled_lookahead_stepsize:
+            lookahead_stepsize = self.lookahead_stepsize * self.get_lr_lambda()
+        else:
+            lookahead_stepsize = self.lookahead_stepsize
+        self.current_lookahead_stepsize = lookahead_stepsize
+
+        for group in self.param_groups:
+            for p in group['params']:
+
+                param_state = self.state[p]         
+
+                lookahead = param_state['lookahead_buffer'][0]
+       
+                p.add_(lookahead, alpha=lookahead_stepsize)
+
+
+
+    @torch.no_grad()
+    def accum_lookahead(self):
+        """Update nesterov's lookahead direction."""
+        lookahead_ema = self.lookahead_ema
+        for group in self.param_groups:
+            for p in group['params']:
+                param_state = self.state[p]
+                look = p.add(param_state['prev_params'][0], alpha=-1)
+
+                # update lookahead buffer
+                buf = param_state['lookahead_buffer'][0]
+
+                param_state['lookahead_buffer'] = (buf.lerp_(look, 1 - lookahead_ema), self.it) # m^{t+1} = beta * m^t + (1-beta) * look
+
+                # update prev_params buffer
+                param_state['prev_params'] = (param_state['prev_params'][0].copy_(p), self.it)
+
+    
+    @torch.no_grad()
+    def nesterov_step(self):
+        if self.it + 1 > self.prefill_steps and self.it < self.rest_steps and not self.lookahead_status:
+            self.lookahead_step()
+        else:
+            self.current_lookahead_stepsize = 0
+        self.lookahead_status = True
+
+    @torch.no_grad()
+    def step(self):
+        if not self.lookahead_status:
+            raise ValueError("optimizer.nesterov_step() should be invoked before model forward pass.")
+        if isinstance(self.inner_optimizer, list):
+            for opt in self.inner_optimizer:
+                opt.step()
+        else:
+            self.inner_optimizer.step()
+        
+        self.accum_lookahead()
+
+        self.lookahead_status = False
+        self.it += 1
+    
+
+########################################
+#                Setup                 #
+########################################
+
+# torchrun sets these env variables
+device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+torch.cuda.set_device(device)
+torch.manual_seed(SEED)
+dist.init_process_group(backend="nccl", device_id=device)
+dist.barrier()
+# this code can be run equivalently with 1, 2, 4, or 8 gpus.
+assert 8 % dist.get_world_size() == 0
+
+# logging setup
+if dist.get_rank() == 0:
+    log_dir = LOG_DIR
+    log_dir.mkdir(parents=True, exist_ok=True)
+    logfile = str(log_dir / f"{uuid.uuid4()}.txt")
+    print(logfile, flush=True)
+
+def print0(s, console=False, log=True):
+    if dist.get_rank() == 0:
+        if console:
+            print(s, flush=True)
+        if log:
+            with open(logfile, "a") as f:
+                print(s, file=f)
+
+# we begin by logging this file itself
+print0(code)
+print0("="*100)
+print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
+print0(f"Running on device_name={torch.cuda.get_device_name(device)} with world_size={dist.get_world_size()}")
+print0(f"Run UTC timestamp={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}")
+print0(f"Using seed={SEED}")
+print0(f"Experiment={EXPERIMENT_NAME}")
+print0(f"Intuition={EXPERIMENT_INTUITION}")
+print0("Muon update linearly changes from Contra Muon to normal Muon, then normal Muon to soft Muon.")
+print0("This script retains the PR 274 NorMuon-lite row/column variance normalization and u/w-floor postprocessing.")
+print0("MLP and V SOAP stay on all run; V SOAP blend is fixed at 0.95.")
+print0(f"Schedule uses hardcoded PR 287 cooldown constants with train_steps={FINAL_TRAIN_STEPS}, schedule_steps={FINAL_SCHEDULE_STEPS}.")
+print0(f"Using tail_schedule_switch_step={TAIL_SCHEDULE_SWITCH_STEP}")
+print0(f"Using tail_schedule_steps={TAIL_SCHEDULE_STEPS}")
+print0(f"Using tail_schedule_ramp_start_step={TAIL_SCHEDULE_RAMP_START_STEP}")
+print0(f"Using tail_schedule_ramp_end_step={TAIL_SCHEDULE_RAMP_END_STEP}")
+print0(f"Using tail_schedule_stage2_switch_step={TAIL_SCHEDULE_STAGE2_SWITCH_STEP}")
+print0(f"Using tail_schedule_stage2_steps={TAIL_SCHEDULE_STAGE2_STEPS}")
+print0(f"Using contra_muon_coeff={CONTRA_MUON_COEFF}")
+print0(f"Using soft_muon_p={SOFT_MUON_P}")
+print0(f"Using soft_muon_scale={SOFT_MUON_SCALE}")
+print0(f"Using soft_muon_input_norm={SOFT_MUON_INPUT_NORM}")
+print0(f"Using soft_muon_ceil={SOFT_MUON_CEIL}")
+print0(f"Using contra_hold_end_step={CONTRA_HOLD_END_STEP}")
+print0(f"Using contra_to_normal_end_step={CONTRA_TO_NORMAL_END_STEP}")
+print0(f"Using normal_to_soft_start_step={NORMAL_TO_SOFT_START_STEP}")
+print0(f"Using normal_to_soft_end_step={NORMAL_TO_SOFT_END_STEP}")
+print0(f"Using muon_history_steps={MUON_HISTORY_STEPS}")
+print0(f"Using muon_history_steps_late={MUON_HISTORY_STEPS_LATE}")
+print0(f"Using muon_history_steps_switch_step={MUON_HISTORY_STEPS_SWITCH_STEP}")
+print0(f"Using muon_history_blend={MUON_HISTORY_BLEND}")
+print0(f"Using muon_history_blend_late={MUON_HISTORY_BLEND_LATE}")
+print0(f"Using muon_history_blend_switch_step={MUON_HISTORY_BLEND_SWITCH_STEP}")
+print0(f"Using muon_history_lookahead={MUON_HISTORY_LOOKAHEAD}")
+print0(f"Using muon_history_min_cos={MUON_HISTORY_MIN_COS}")
+print0(f"Using muon_history_min_cos_late={MUON_HISTORY_MIN_COS_LATE}")
+print0(f"Using muon_history_min_cos_decay_start_step={MUON_HISTORY_MIN_COS_DECAY_START_STEP}")
+print0(f"Using muon_history_min_cos_decay_end_step={MUON_HISTORY_MIN_COS_DECAY_END_STEP}")
+print0(f"Using muon_history_max_delta={MUON_HISTORY_MAX_DELTA}")
+print0(f"Using muon_history_adaptive_steps={MUON_HISTORY_ADAPTIVE_STEPS}")
+print0(f"Using muon_history_adapt_margin={MUON_HISTORY_ADAPT_MARGIN}")
+print0(f"Using muon_history_adapt_delta_ratio={MUON_HISTORY_ADAPT_DELTA_RATIO}")
+print0(f"Using muon_history_diag={int(MUON_HISTORY_DIAG)}")
+print0(f"Using muon_history_diag_every={MUON_HISTORY_DIAG_EVERY}")
+print0(f"Using muon_history_decay_start_step={MUON_HISTORY_DECAY_START_STEP}")
+print0(f"Using muon_history_decay_end_step={MUON_HISTORY_DECAY_END_STEP}")
+print0(f"Using muon_history_final_blend_mult={MUON_HISTORY_FINAL_BLEND_MULT}")
+print0(f"Using muon_history_scope={MUON_HISTORY_SCOPE}")
+print0(f"Using muon_history_block_min={MUON_HISTORY_BLOCK_MIN}")
+print0(f"Using muon_history_block_max={MUON_HISTORY_BLOCK_MAX}")
+print0(f"Using muon_history_steps_late_scope={MUON_HISTORY_STEPS_LATE_SCOPE}")
+print0(f"Using muon_history_steps_late_ramp_start_step={MUON_HISTORY_STEPS_LATE_RAMP_START_STEP}")
+print0(f"Using muon_history_steps_late_ramp_end_step={MUON_HISTORY_STEPS_LATE_RAMP_END_STEP}")
+print0(f"Using circuit_history_steps={CIRCUIT_HISTORY_STEPS}")
+print0(f"Using circuit_history_blend={CIRCUIT_HISTORY_BLEND}")
+print0(f"Using circuit_history_lookahead={CIRCUIT_HISTORY_LOOKAHEAD}")
+print0(f"Using circuit_history_min_cos={CIRCUIT_HISTORY_MIN_COS}")
+print0(f"Using circuit_history_max_delta={CIRCUIT_HISTORY_MAX_DELTA}")
+print0(f"Using circuit_history_start_step={CIRCUIT_HISTORY_START_STEP}")
+print0(f"Using circuit_history_scope={CIRCUIT_HISTORY_SCOPE}")
+print0(f"Using circuit_history_decay_start_step={CIRCUIT_HISTORY_DECAY_START_STEP}")
+print0(f"Using circuit_history_decay_end_step={CIRCUIT_HISTORY_DECAY_END_STEP}")
+print0(f"Using circuit_history_final_blend_mult={CIRCUIT_HISTORY_FINAL_BLEND_MULT}")
+print0(f"Using circuit_history_agree_shrink={CIRCUIT_HISTORY_AGREE_SHRINK}")
+print0(f"Using circuit_history_agree_min_scale={CIRCUIT_HISTORY_AGREE_MIN_SCALE}")
+print0(f"Using soap_history_steps={SOAP_HISTORY_STEPS}")
+print0(f"Using soap_history_blend={SOAP_HISTORY_BLEND}")
+print0(f"Using soap_history_lookahead={SOAP_HISTORY_LOOKAHEAD}")
+print0(f"Using soap_history_min_cos={SOAP_HISTORY_MIN_COS}")
+print0(f"Using soap_history_max_delta={SOAP_HISTORY_MAX_DELTA}")
+print0(f"Using soap_history_decay_start_step={SOAP_HISTORY_DECAY_START_STEP}")
+print0(f"Using soap_history_decay_end_step={SOAP_HISTORY_DECAY_END_STEP}")
+print0(f"Using soap_history_final_blend_mult={SOAP_HISTORY_FINAL_BLEND_MULT}")
+print0(f"Using muon_output_history_steps={MUON_OUTPUT_HISTORY_STEPS}")
+print0(f"Using muon_output_history_blend={MUON_OUTPUT_HISTORY_BLEND}")
+print0(f"Using muon_output_history_lookahead={MUON_OUTPUT_HISTORY_LOOKAHEAD}")
+print0(f"Using muon_output_history_min_cos={MUON_OUTPUT_HISTORY_MIN_COS}")
+print0(f"Using muon_output_history_max_delta={MUON_OUTPUT_HISTORY_MAX_DELTA}")
+print0(f"Using muon_output_history_decay_start_step={MUON_OUTPUT_HISTORY_DECAY_START_STEP}")
+print0(f"Using muon_output_history_decay_end_step={MUON_OUTPUT_HISTORY_DECAY_END_STEP}")
+print0(f"Using muon_output_history_final_blend_mult={MUON_OUTPUT_HISTORY_FINAL_BLEND_MULT}")
+print0(f"Using radial_history_beta={RADIAL_HISTORY_BETA}")
+print0(f"Using radial_history_blend={RADIAL_HISTORY_BLEND}")
+print0(f"Using radial_history_start_step={RADIAL_HISTORY_START_STEP}")
+print0(f"Using radial_history_end_step={RADIAL_HISTORY_END_STEP}")
+print0(f"Using attn_trust_history_beta={ATTN_TRUST_HISTORY_BETA}")
+print0(f"Using attn_trust_history_blend={ATTN_TRUST_HISTORY_BLEND}")
+print0(f"Using attn_trust_history_start_step={ATTN_TRUST_HISTORY_START_STEP}")
+print0(f"Using attn_trust_history_end_step={ATTN_TRUST_HISTORY_END_STEP}")
+print0(f"Using muon_output_ema_beta={MUON_OUTPUT_EMA_BETA}")
+print0(f"Using muon_output_ema_blend={MUON_OUTPUT_EMA_BLEND}")
+print0(f"Using muon_output_ema_min_cos={MUON_OUTPUT_EMA_MIN_COS}")
+print0(f"Using muon_output_ema_start_step={MUON_OUTPUT_EMA_START_STEP}")
+print0(f"Using muon_output_ema_end_step={MUON_OUTPUT_EMA_END_STEP}")
+print0(f"Using contra_history_steps={CONTRA_HISTORY_STEPS}")
+print0(f"Using contra_history_blend={CONTRA_HISTORY_BLEND}")
+print0(f"Using contra_history_lookahead={CONTRA_HISTORY_LOOKAHEAD}")
+print0(f"Using contra_history_min_cos={CONTRA_HISTORY_MIN_COS}")
+print0(f"Using contra_history_max_delta={CONTRA_HISTORY_MAX_DELTA}")
+print0(f"Using contra_history_start_step={CONTRA_HISTORY_START_STEP}")
+print0(f"Using contra_history_end_step={CONTRA_HISTORY_END_STEP}")
+print0(f"Using mu={MU}")
+print0(f"Using muon_lr={MUON_LR}")
+print0(f"Using muon_weight_decay={MUON_WEIGHT_DECAY}")
+print0(f"Using target_uw={TARGET_UW}")
+print0(f"Using soap_target_uw={SOAP_TARGET_UW}")
+print0(f"Using nonsoap_target_uw={NONSOAP_TARGET_UW}")
+print0(f"Using nor_beta2={NOR_BETA2}")
+print0(f"Using soap_beta2={SOAP_BETA2}")
+print0(f"Using soap_precondition_frequency={SOAP_PRECONDITION_FREQUENCY}")
+print0(f"Using soap_denom_power={SOAP_DENOM_POWER}")
+print0(f"Using soap_blend={SOAP_BLEND}")
+print0(f"Using soap_update_before_use={SOAP_UPDATE_BEFORE_USE}")
+print0(f"Using soap_param_mode={SOAP_PARAM_MODE}")
+print0(f"Using attn_soap_denom_floor={ATTN_SOAP_DENOM_FLOOR}")
+print0(f"Using attn_soap_blend={ATTN_SOAP_BLEND}")
+print0(f"Using v_soap_blend={V_SOAP_BLEND}")
+print0(f"Using v_soap_blend_ramp_end_step={V_SOAP_BLEND_RAMP_END_STEP}")
+print0(f"Using attn_early_trust_floor={ATTN_EARLY_TRUST_FLOOR}")
+print0(f"Using attn_early_trust_cap={ATTN_EARLY_TRUST_CAP}")
+print0(f"Using attn_trust_floor_end_step={ATTN_TRUST_FLOOR_END_STEP}")
+print0(f"Using attn_trust_floor_fade_end_step={ATTN_TRUST_FLOOR_FADE_END_STEP}")
+print0(f"Using attn_trust_min_agree={ATTN_TRUST_MIN_AGREE}")
+print0(f"Using attn_trust_min_grad_align={ATTN_TRUST_MIN_GRAD_ALIGN}")
+print0(f"Using attn_trust_power={ATTN_TRUST_POWER}")
+print0(f"Using attn_soap_fade_start_step={ATTN_SOAP_FADE_START_STEP}")
+print0(f"Using attn_soap_fade_end_step={ATTN_SOAP_FADE_END_STEP}")
+print0(f"Using no_contra_param={NO_CONTRA_PARAM}")
+print0(f"Using no_softmuon_param={NO_SOFTMUON_PARAM}")
+print0(f"Using radial_outward_scale={RADIAL_OUTWARD_SCALE}")
+print0(f"Using radial_inward_scale={RADIAL_INWARD_SCALE}")
+print0(f"Using circuit_ov_damping={CIRCUIT_OV_DAMPING}  head_dim={HEAD_DIM}")
+print0(f"Using dense_eval_start={DENSE_EVAL_START}")
+print0(f"Using dense_eval_end={DENSE_EVAL_END}")
+print0(f"Using dense_eval_stride={DENSE_EVAL_STRIDE}")
+print0(f"Using ema_nesterov_rest_steps={EMA_NESTEROV_REST_STEPS}")
+print0(f"Using mu_cooldown_steps={MU_COOLDOWN_STEPS}")
+print0(f"Using trail_delta_start_step={TRAIL_DELTA_START_STEP}")
+print0(f"Using trail_delta_end_step={TRAIL_DELTA_END_STEP}")
+print0(f"Using trail_delta_interval={TRAIL_DELTA_INTERVAL}")
+print0(f"Using trail_delta_gamma={TRAIL_DELTA_GAMMA}")
+print0(f"Using trail_delta_gamma_first={TRAIL_DELTA_GAMMA_FIRST}")
+print0(f"Using trail_delta_gamma_final={TRAIL_DELTA_GAMMA_FINAL}")
+print0(f"Using trail_delta_scope={TRAIL_DELTA_SCOPE}")
+print0(f"Using trail_delta_max_move_ratio={TRAIL_DELTA_MAX_MOVE_RATIO}")
+print0(f"Using trail_delta_momentum_beta={TRAIL_DELTA_MOMENTUM_BETA}")
+print0(f"Using trail_delta_sync_nesterov_state={TRAIL_DELTA_SYNC_NESTEROV_STATE}")
+print0(f"Using trail_delta_lookahead_inject={TRAIL_DELTA_LOOKAHEAD_INJECT}")
+print0(f"Using trail_delta_adam_moment_damp={TRAIL_DELTA_ADAM_MOMENT_DAMP}")
+print0(f"Using trail_delta_muon_moment_damp={TRAIL_DELTA_MUON_MOMENT_DAMP}")
+print0(f"Using state_refresh_schedule={STATE_REFRESH_SCHEDULE}")
+print0(f"Using state_refresh_adam_exp_avg_damp={STATE_REFRESH_ADAM_EXP_AVG_DAMP}")
+print0(f"Using state_refresh_adam_exp_avg_sq_damp={STATE_REFRESH_ADAM_EXP_AVG_SQ_DAMP}")
+print0(f"Using state_refresh_muon_momentum_damp={STATE_REFRESH_MUON_MOMENTUM_DAMP}")
+print0(f"Using state_refresh_muon_second_damp={STATE_REFRESH_MUON_SECOND_DAMP}")
+print0(f"Using state_refresh_lookahead_damp={STATE_REFRESH_LOOKAHEAD_DAMP}")
+print0(f"Using broad_delta_capture_step={BROAD_DELTA_CAPTURE_STEP}")
+print0(f"Using broad_delta_apply_step={BROAD_DELTA_APPLY_STEP}")
+print0(f"Using broad_delta_gamma={BROAD_DELTA_GAMMA}")
+print0(f"Using broad_delta_scope={BROAD_DELTA_SCOPE}")
+print0(f"Using broad_delta_max_move_ratio={BROAD_DELTA_MAX_MOVE_RATIO}")
+print0(f"Using broad_delta_schedule={BROAD_DELTA_SCHEDULE}")
+print0(f"Using final_readout_anchor_step={FINAL_READOUT_ANCHOR_STEP}")
+print0(f"Using final_readout_apply_step={FINAL_READOUT_APPLY_STEP}")
+print0(f"Using final_readout_alpha={FINAL_READOUT_ALPHA}")
+print0(f"Using final_readout_scope={FINAL_READOUT_SCOPE}")
+print0(f"Using final_readout_max_move_ratio={FINAL_READOUT_MAX_MOVE_RATIO}")
+print0(f"Using final_readout_linesearch_alphas={FINAL_READOUT_LINESEARCH_ALPHAS}")
+print0(f"Using final_readout_linesearch_microbatches={FINAL_READOUT_LINESEARCH_MICROBATCHES}")
+print0(f"Using final_readout_sweep_alphas={FINAL_READOUT_SWEEP_ALPHAS}")
+print0(f"Using curve_readout_window={CURVE_READOUT_WINDOW}")
+print0(f"Using curve_readout_start_step={CURVE_READOUT_START_STEP}")
+print0(f"Using curve_readout_apply_step={CURVE_READOUT_APPLY_STEP}")
+print0(f"Using curve_readout_degree={CURVE_READOUT_DEGREE}")
+print0(f"Using curve_readout_predict_ahead={CURVE_READOUT_PREDICT_AHEAD}")
+print0(f"Using curve_readout_mode={CURVE_READOUT_MODE}")
+print0(f"Using curve_readout_scope={CURVE_READOUT_SCOPE}")
+print0(f"Using curve_readout_max_move_ratio={CURVE_READOUT_MAX_MOVE_RATIO}")
+print0(f"Using curve_readout_blend={CURVE_READOUT_BLEND}")
+print0(f"Using curve_readout_collect_before_trail_delta={CURVE_READOUT_COLLECT_BEFORE_TRAIL_DELTA}")
+print0(f"Using curve_readout_linesearch_blends={CURVE_READOUT_LINESEARCH_BLENDS}")
+print0(f"Using curve_readout_linesearch_microbatches={CURVE_READOUT_LINESEARCH_MICROBATCHES}")
+print0(f"Using curve_readout_sweep_aheads={CURVE_READOUT_SWEEP_AHEADS}")
+print0(f"Using curve_readout_sweep_blends={CURVE_READOUT_SWEEP_BLENDS}")
+print0(f"Using curve_readout_sweep_modes={CURVE_READOUT_SWEEP_MODES}")
+print0(f"Using checkpoint_dir={CHECKPOINT_DIR}")
+print0(f"Using checkpoint_prefix={CHECKPOINT_PREFIX}")
+print0(f"Using save_checkpoint_steps={sorted(SAVE_CHECKPOINT_STEPS)}")
+print0(f"Using load_checkpoint={LOAD_CHECKPOINT}")
+print0(f"Using align_dataloader_on_load={ALIGN_DATALOADER_ON_LOAD}")
+print0(f"Using exit_after_save_checkpoint={EXIT_AFTER_SAVE_CHECKPOINT}")
+print0(f"Using exit_after_save_checkpoint_step={EXIT_AFTER_SAVE_CHECKPOINT_STEP}")
+print0(f"Using macro_cem_mode={MACRO_CEM_MODE}")
+print0(f"Using macro_cem_group_mode={MACRO_CEM_GROUP_MODE}")
+print0(f"Using macro_ref_t0={MACRO_REF_T0}")
+print0(f"Using macro_ref_t1={MACRO_REF_T1}")
+print0(f"Using macro_ref_t2={MACRO_REF_T2}")
+print0(f"Using model_layers={MODEL_LAYERS}")
+print0(f"Using model_dim={MODEL_DIM}")
+print0(f"Using vocab_size={VOCAB_SIZE}")
+print0(f"Using val_tokens={VAL_TOKENS}")
+print0(f"Using batch_tokens={BATCH_TOKENS}")
+print0(f"Using micro_batch_seqs={MICRO_BATCH_SEQS}")
+print0(f"Using val_regular_interval={VAL_REGULAR_INTERVAL}")
+print0("Dampened radial gradient component is applied before the u/w floor; post-step radius is corrected to remove tangent drift.")
+print0("Circuit-Muon couples each attn.v <-> attn.proj pair: per-head partner-scalar post-whitening (norm-preserving) + trace-only gauge rebalance.")
+print0("="*100)
+
+val_tokens = VAL_TOKENS
+batch_size = BATCH_TOKENS
+mbs = MICRO_BATCH_SEQS
+train_loader = distributed_data_generator("data/fineweb10B/fineweb_train_*.bin", batch_size)
+val_inputs, val_targets = next(distributed_data_generator("data/fineweb10B/fineweb_val_*.bin", val_tokens))
+
+model = GPT(vocab_size=VOCAB_SIZE, num_layers=MODEL_LAYERS, model_dim=MODEL_DIM).cuda()
+model.compile(dynamic=False)
+
+
+########################################
+#       Init & Optim Hyperparams       #
+########################################
+
+# we want to minimize this while still reaching 3.28 val loss
+train_steps = FINAL_TRAIN_STEPS
+val_regular_interval = VAL_REGULAR_INTERVAL
+extra_val_steps = {
+    step
+    for step in range(DENSE_EVAL_START, DENSE_EVAL_END + 1, DENSE_EVAL_STRIDE)
+    if 0 <= step <= train_steps
+}
+
+# initialize model parameters
+for name, p in model.named_parameters():
+    if "proj" in name:
+        p.data.zero_()
+
+# v44: v13 depth-scaled mlp.fc init alpha=0.30 (ported from opus v15)
+_DI_FC_ALPHA = 0.30
+_NUM_BLOCKS = len(model.blocks)
+with torch.no_grad():
+    for l_idx, block in enumerate(model.blocks):
+        ramp = l_idx / (_NUM_BLOCKS - 1) if _NUM_BLOCKS > 1 else 0.0
+        s_l = 1.0 - _DI_FC_ALPHA * ramp
+        block.mlp.fc.weight.data.mul_(s_l)
+
+# v44: v14 CGI Rademacher channel-gain split alpha=0.14 (ported from opus v15)
+_CGI_ALPHA = 0.14
+with torch.no_grad():
+    for block in model.blocks:
+        s = (torch.randint(0, 2, block.norm1.gains.shape,
+                           device=block.norm1.gains.device, dtype=torch.float32) * 2 - 1)
+        block.norm1.gains.data.copy_((1.0 - _CGI_ALPHA * s).to(block.norm1.gains.dtype))
+        block.norm2.gains.data.copy_((1.0 + _CGI_ALPHA * s).to(block.norm2.gains.dtype))
+
+# create the optimizer(s)
+optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.3),
+                    dict(params=[model.proj.weight], lr=1/320),
+                    dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.01)],
+                   betas=(0.8, 0.99), eps=1e-10, weight_decay=0, fused=True)
+# Skylight-001: NorMuon-lite (per-row variance) + u/w-floor=0.35 + lr=0.0375 + wd=0.025.
+muon_history = None
+if MUON_HISTORY_STEPS > 0:
+    muon_history = dict(
+        muon_history_steps=MUON_HISTORY_STEPS,
+        muon_history_steps_late=MUON_HISTORY_STEPS_LATE,
+        muon_history_steps_switch_step=MUON_HISTORY_STEPS_SWITCH_STEP,
+        muon_history_blend=MUON_HISTORY_BLEND,
+        muon_history_blend_late=MUON_HISTORY_BLEND_LATE,
+        muon_history_blend_switch_step=MUON_HISTORY_BLEND_SWITCH_STEP,
+        muon_history_lookahead=MUON_HISTORY_LOOKAHEAD,
+        muon_history_min_cos=MUON_HISTORY_MIN_COS,
+        muon_history_min_cos_late=MUON_HISTORY_MIN_COS_LATE,
+        muon_history_min_cos_decay_start_step=MUON_HISTORY_MIN_COS_DECAY_START_STEP,
+        muon_history_min_cos_decay_end_step=MUON_HISTORY_MIN_COS_DECAY_END_STEP,
+        muon_history_max_delta=MUON_HISTORY_MAX_DELTA,
+        muon_history_adaptive_steps=MUON_HISTORY_ADAPTIVE_STEPS,
+        muon_history_adapt_margin=MUON_HISTORY_ADAPT_MARGIN,
+        muon_history_adapt_delta_ratio=MUON_HISTORY_ADAPT_DELTA_RATIO,
+        muon_history_decay_start_step=MUON_HISTORY_DECAY_START_STEP,
+        muon_history_decay_end_step=MUON_HISTORY_DECAY_END_STEP,
+        muon_history_final_blend_mult=MUON_HISTORY_FINAL_BLEND_MULT,
+        muon_history_steps_late_ramp_start_step=MUON_HISTORY_STEPS_LATE_RAMP_START_STEP,
+        muon_history_steps_late_ramp_end_step=MUON_HISTORY_STEPS_LATE_RAMP_END_STEP,
+    )
+optimizer2 = Muon([(n, p) for n, p in model.blocks.named_parameters() if p.ndim >= 2],
+                  lr=MUON_LR, weight_decay=MUON_WEIGHT_DECAY, mu=MU, muon_history=muon_history)
+optimizers = [optimizer1, optimizer2]
+optimizers = [EMA_Nesterov(
+        [p for p in model.parameters()],
+        optimizers,
+        lookahead_stepsize=0.3,
+        use_scheduled_lookahead_stepsize=True,
+        lookahead_ema=0.99,
+        prefill_steps=300,
+        rest_steps=EMA_NESTEROV_REST_STEPS,
+    )]
+assert set(p for opt in optimizers for group in opt.param_groups
+           for p in group["params"]) == set(model.parameters())
+for opt in optimizers[0].inner_optimizer:
+    for group in opt.param_groups:
+        group["initial_lr"] = group["lr"]
+optimizer1.param_groups[0]["power_c"] = ADAM_EMBED_POWER_C
+optimizer1.param_groups[1]["power_c"] = ADAM_PROJ_POWER_C
+optimizer1.param_groups[2]["power_c"] = ADAM_OTHER_POWER_C
+optimizer2.param_groups[0]["power_c"] = MUON_POWER_C
+
+trail_delta_state = None
+trail_delta_last_step = None
+trail_delta_momentum_state = None
+trail_delta_apply_count = 0
+broad_delta_state = None
+broad_delta_applied = False
+final_readout_state = None
+final_readout_applied = False
+
+def parse_broad_delta_schedule(spec: str):
+    schedule = []
+    for part in spec.split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        fields = [item.strip() for item in part.split(":")]
+        if len(fields) != 3:
+            raise RuntimeError(f"invalid BROAD_DELTA_SCHEDULE entry: {part!r}")
+        capture_step, apply_step, gamma = fields
+        schedule.append(
+            {
+                "capture": int(capture_step),
+                "apply": int(apply_step),
+                "gamma": float(gamma),
+                "state": None,
+                "applied": False,
+            }
+        )
+    return schedule
+
+broad_delta_schedule = parse_broad_delta_schedule(BROAD_DELTA_SCHEDULE)
+
+def parse_state_refresh_schedule(spec: str):
+    schedule = []
+    for part in spec.split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            step_s, modes_s = part.split(":", 1)
+        except ValueError as exc:
+            raise RuntimeError(f"invalid STATE_REFRESH_SCHEDULE entry: {part!r}") from exc
+        modes = tuple(mode.strip() for mode in modes_s.split(",") if mode.strip())
+        if not modes:
+            raise RuntimeError(f"state refresh entry has no modes: {part!r}")
+        schedule.append({"step": int(step_s), "modes": modes, "applied": False})
+    return schedule
+
+state_refresh_schedule = parse_state_refresh_schedule(STATE_REFRESH_SCHEDULE)
+curve_readout_stats = None
+curve_readout_count = 0
+curve_readout_applied = False
+
+def _param_in_scope(scope: str, name: str, p: Tensor) -> bool:
+    if scope == "all":
+        return True
+    if scope == "nonembed":
+        return name != "embed.weight"
+    if scope == "muon":
+        return name.startswith("blocks.") and p.ndim >= 2
+    if scope == "ov":
+        return name.endswith(".attn.v.weight") or name.endswith(".attn.proj.weight")
+    if scope == "muon_other":
+        return (
+            name.startswith("blocks.") and p.ndim >= 2
+            and not (name.endswith(".attn.v.weight") or name.endswith(".attn.proj.weight"))
+        )
+    if scope == "adam":
+        return not (name.startswith("blocks.") and p.ndim >= 2)
+    if scope == "adam_nonembed":
+        return name != "embed.weight" and not (name.startswith("blocks.") and p.ndim >= 2)
+    raise RuntimeError(f"unsupported param scope: {scope}")
+
+def trail_delta_in_scope(name: str, p: Tensor) -> bool:
+    return _param_in_scope(TRAIL_DELTA_SCOPE, name, p)
+
+def broad_delta_in_scope(name: str, p: Tensor) -> bool:
+    return _param_in_scope(BROAD_DELTA_SCOPE, name, p)
+
+def final_readout_in_scope(name: str, p: Tensor) -> bool:
+    return _param_in_scope(FINAL_READOUT_SCOPE, name, p)
+
+def curve_readout_in_scope(name: str, p: Tensor) -> bool:
+    return _param_in_scope(CURVE_READOUT_SCOPE, name, p)
+
+def _curve_readout_scoped_params():
+    return [
+        (name, p)
+        for name, p in model.named_parameters()
+        if torch.is_floating_point(p) and curve_readout_in_scope(name, p)
+    ]
+
+@torch.no_grad()
+def maybe_update_curve_readout_state(step: int):
+    global curve_readout_stats, curve_readout_count
+    if CURVE_READOUT_WINDOW <= 0:
+        return
+    if step < CURVE_READOUT_START_STEP or step >= CURVE_READOUT_START_STEP + CURVE_READOUT_WINDOW:
+        return
+    scoped = _curve_readout_scoped_params()
+    if curve_readout_stats is None:
+        curve_readout_stats = {}
+        for name, p in scoped:
+            stats = {
+                "sum_y": torch.zeros_like(p.detach(), dtype=torch.float32),
+                "sum_xy": torch.zeros_like(p.detach(), dtype=torch.float32),
+            }
+            if CURVE_READOUT_DEGREE >= 2:
+                stats["sum_x2y"] = torch.zeros_like(p.detach(), dtype=torch.float32)
+            if CURVE_READOUT_DEGREE >= 3:
+                stats["sum_x3y"] = torch.zeros_like(p.detach(), dtype=torch.float32)
+            curve_readout_stats[name] = stats
+        print0(
+            f"curve_readout initialized step:{step} tensors:{len(scoped)} "
+            + f"window:{CURVE_READOUT_WINDOW} degree:{CURVE_READOUT_DEGREE}",
+            console=True,
+        )
+    x = float(curve_readout_count)
+    for name, p in scoped:
+        y = p.detach().float()
+        stats = curve_readout_stats[name]
+        stats["sum_y"].add_(y)
+        stats["sum_xy"].add_(y, alpha=x)
+        if CURVE_READOUT_DEGREE >= 2:
+            stats["sum_x2y"].add_(y, alpha=x * x)
+        if CURVE_READOUT_DEGREE >= 3:
+            stats["sum_x3y"].add_(y, alpha=x * x * x)
+    curve_readout_count += 1
+    if curve_readout_count == CURVE_READOUT_WINDOW:
+        print0(
+            f"curve_readout collected step:{step} count:{curve_readout_count} "
+            + f"predict_ahead:{CURVE_READOUT_PREDICT_AHEAD:g}",
+            console=True,
+        )
+
+def _curve_readout_weights(n: int, degree: int, predict_x: float):
+    if degree <= 1:
+        s0 = float(n)
+        s1 = float(n * (n - 1) / 2)
+        s2 = float((n - 1) * n * (2 * n - 1) / 6)
+        den = s0 * s2 - s1 * s1
+        if den <= 0:
+            return None
+        w_y = (s2 - predict_x * s1) / den
+        w_xy = (s0 * predict_x - s1) / den
+        return [w_y, w_xy]
+    degree = min(degree, 3)
+    s = [sum(float(x ** k) for x in range(n)) for k in range(2 * degree + 1)]
+    a = torch.tensor(
+        [[s[i + j] for j in range(degree + 1)] for i in range(degree + 1)],
+        dtype=torch.float64,
+    )
+    v = torch.tensor([float(predict_x ** k) for k in range(degree + 1)], dtype=torch.float64)
+    w = torch.linalg.solve(a, v)
+    return [float(w[i]) for i in range(degree + 1)]
+
+def _curve_readout_prediction(stats: dict[str, Tensor], weights: list[float]):
+    pred = stats["sum_y"] * weights[0] + stats["sum_xy"] * weights[1]
+    if len(weights) >= 3:
+        pred = pred + stats["sum_x2y"] * weights[2]
+    if len(weights) >= 4:
+        pred = pred + stats["sum_x3y"] * weights[3]
+    return pred
+
+@torch.no_grad()
+def maybe_apply_curve_readout(step: int):
+    global curve_readout_applied
+    if CURVE_READOUT_WINDOW <= 0 or curve_readout_applied:
+        return
+    if step != CURVE_READOUT_APPLY_STEP:
+        return
+    if curve_readout_stats is None or curve_readout_count < max(CURVE_READOUT_DEGREE + 1, 2):
+        print0(f"curve_readout skipped step:{step} collected:{curve_readout_count}", console=True)
+        curve_readout_applied = True
+        return
+    n = curve_readout_count
+
+    def build_unit_moves(mode: str, predict_ahead: float):
+        predict_x = float(n - 1) + predict_ahead
+        weights = _curve_readout_weights(n, CURVE_READOUT_DEGREE, predict_x)
+        base_weights = _curve_readout_weights(n, CURVE_READOUT_DEGREE, float(n - 1))
+        if weights is None:
+            return None
+        if mode in ("trend", "smooth") and base_weights is None:
+            return None
+        unit_move_sq = torch.zeros((), device=device)
+        unit_moves = []
+        for name, p in _curve_readout_scoped_params():
+            stats = curve_readout_stats.get(name)
+            if stats is None:
+                continue
+            pred = _curve_readout_prediction(stats, weights).to(device=device)
+            if mode == "point":
+                move = pred.sub_(p.detach().float())
+            elif mode == "trend":
+                base_pred = _curve_readout_prediction(stats, base_weights).to(device=device)
+                move = pred.sub_(base_pred)
+            elif mode == "smooth":
+                base_pred = _curve_readout_prediction(stats, base_weights).to(device=device)
+                move = base_pred.sub_(p.detach().float())
+            else:
+                raise RuntimeError(f"unsupported curve_readout_mode: {mode}")
+            unit_move_sq += move.square().sum()
+            unit_moves.append((name, p, move))
+        return predict_x, weights, unit_move_sq, unit_moves
+
+    built = build_unit_moves(CURVE_READOUT_MODE, CURVE_READOUT_PREDICT_AHEAD)
+    if built is None:
+        print0(f"curve_readout skipped singular step:{step} count:{n}", console=True)
+        curve_readout_applied = True
+        return
+    predict_x, weights, unit_move_sq, unit_moves = built
+
+    def apply_curve_blend(moves, blend: float):
+        moved_sq = torch.zeros((), device=device)
+        raw_move_sq = torch.zeros((), device=device)
+        clipped_count = 0
+        applied = []
+        for _name, p, unit_move in moves:
+            move = unit_move.mul(blend)
+            raw_move_sq += move.square().sum()
+            if CURVE_READOUT_MAX_MOVE_RATIO > 0.0:
+                max_move = CURVE_READOUT_MAX_MOVE_RATIO * p.detach().float().norm().clamp_min(1e-12)
+                move_norm = move.norm()
+                if move_norm > max_move:
+                    move = move * (max_move / (move_norm + 1e-12))
+                    clipped_count += 1
+            p.add_(move.to(dtype=p.dtype))
+            moved_sq += move.square().sum()
+            applied.append((p, move))
+        return applied, raw_move_sq, moved_sq, clipped_count
+
+    def revert_curve_blend(applied):
+        for p, move in reversed(applied):
+            p.sub_(move.to(dtype=p.dtype))
+
+    if CURVE_READOUT_SWEEP_AHEADS.strip() and CURVE_READOUT_SWEEP_BLENDS.strip():
+        if step != train_steps:
+            raise RuntimeError("curve_readout val sweep is only supported at the final train step")
+        sweep_aheads = [
+            float(part.strip())
+            for part in CURVE_READOUT_SWEEP_AHEADS.split(",")
+            if part.strip()
+        ]
+        sweep_blends = [
+            float(part.strip())
+            for part in CURVE_READOUT_SWEEP_BLENDS.split(",")
+            if part.strip()
+        ]
+        sweep_modes = [
+            part.strip()
+            for part in (CURVE_READOUT_SWEEP_MODES or CURVE_READOUT_MODE).split(",")
+            if part.strip()
+        ]
+        for mode in sweep_modes:
+            for ahead in sweep_aheads:
+                sweep_built = build_unit_moves(mode, ahead)
+                if sweep_built is None:
+                    print0(f"curve_readout sweep skipped mode:{mode} ahead:{ahead:g}", console=True)
+                    continue
+                sweep_predict_x, _sweep_weights, sweep_unit_sq, sweep_moves = sweep_built
+                for blend in sweep_blends:
+                    applied, raw_sq, moved_sq, clipped_count = apply_curve_blend(sweep_moves, blend)
+                    val = _macro_val_loss()
+                    revert_curve_blend(applied)
+                    print0(
+                        f"curve_readout sweep mode:{mode} ahead:{ahead:g} predict_x:{sweep_predict_x:g} "
+                        + f"blend:{blend:g} val:{val:.5f} "
+                        + f"unit_move_norm:{sweep_unit_sq.sqrt().item():.6f} "
+                        + f"raw_move_norm:{raw_sq.sqrt().item():.6f} "
+                        + f"moved_norm:{moved_sq.sqrt().item():.6f} clipped:{clipped_count}",
+                        console=True,
+                    )
+
+    chosen_blend = CURVE_READOUT_BLEND
+    line_scores = []
+    if CURVE_READOUT_LINESEARCH_BLENDS.strip():
+        if step != train_steps:
+            raise RuntimeError("curve_readout line search is only supported at the final train step")
+        blends = [
+            float(part.strip())
+            for part in CURVE_READOUT_LINESEARCH_BLENDS.split(",")
+            if part.strip()
+        ]
+        inputs, targets = next(train_loader)
+        num_microbatches = min(CURVE_READOUT_LINESEARCH_MICROBATCHES, len(inputs) // mbs)
+        calib_batches = [
+            (inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs])
+            for i in range(num_microbatches)
+        ]
+        best_score = None
+        for blend in blends:
+            applied, _raw_sq, _moved_sq, _clipped = apply_curve_blend(unit_moves, blend)
+            score, calib_mean = _macro_score_calib(calib_batches)
+            revert_curve_blend(applied)
+            line_scores.append((blend, score, calib_mean))
+            if best_score is None or score < best_score:
+                best_score = score
+                chosen_blend = blend
+
+    applied, pred_delta_sq, moved_sq, clipped_count = apply_curve_blend(unit_moves, chosen_blend)
+    curve_readout_applied = True
+    if line_scores:
+        print0(
+            "curve_readout line_search "
+            + " ".join(
+                f"blend:{blend:g}/score:{score:.8f}/mean:{calib_mean:.8f}"
+                for blend, score, calib_mean in line_scores
+            )
+            + f" chosen:{chosen_blend:g}",
+            console=True,
+        )
+    print0(
+        f"curve_readout applied step:{step} count:{n} degree:{CURVE_READOUT_DEGREE} "
+        + f"mode:{CURVE_READOUT_MODE} predict_x:{predict_x:g} "
+        + f"weights:{[round(w, 8) for w in weights]} blend:{chosen_blend:g} "
+        + f"unit_move_norm:{unit_move_sq.sqrt().item():.6f} "
+        + f"tensors:{len(applied)} raw_move_norm:{pred_delta_sq.sqrt().item():.6f} "
+        + f"moved_norm:{moved_sq.sqrt().item():.6f} clipped:{clipped_count}",
+        console=True,
+    )
+
+def macro_cem_group(name: str, p: Tensor) -> str | None:
+    if name == "embed.weight":
+        return None
+    if name.endswith(".attn.v.weight") or name.endswith(".attn.proj.weight"):
+        return "ov"
+    if name.startswith("blocks.") and p.ndim >= 2:
+        return "muon_other"
+    return "adam"
+
+def trail_delta_diag_group(name: str, p: Tensor) -> str:
+    if name == "embed.weight":
+        return "embed"
+    if name.endswith(".attn.v.weight") or name.endswith(".attn.proj.weight"):
+        return "ov"
+    if name.startswith("blocks.") and p.ndim >= 2:
+        return "muon_other"
+    return "adam"
+
+def _scoped_named_params(scope_fn):
+    return [
+        (name, p)
+        for name, p in model.named_parameters()
+        if torch.is_floating_point(p) and scope_fn(name, p)
+    ]
+
+@torch.no_grad()
+def maybe_apply_broad_delta_step(step: int):
+    global broad_delta_state, broad_delta_applied
+    if broad_delta_schedule:
+        scoped = _scoped_named_params(broad_delta_in_scope)
+        for idx, item in enumerate(broad_delta_schedule):
+            if step == item["capture"] and item["state"] is None:
+                item["state"] = {name: p.detach().clone() for name, p in scoped}
+                print0(
+                    f"broad_delta[{idx}] captured step:{step} apply_step:{item['apply']} "
+                    + f"gamma:{item['gamma']:g} tensors:{len(scoped)}",
+                    console=True,
+                )
+                continue
+            if step != item["apply"] or item["applied"]:
+                continue
+            if item["state"] is None:
+                print0(f"broad_delta[{idx}] skipped step:{step} reason:no_capture", console=True)
+                item["applied"] = True
+                continue
+            apply_broad_delta_move(
+                step=step,
+                gamma=item["gamma"],
+                state=item["state"],
+                scoped=scoped,
+                label=f"broad_delta[{idx}]",
+            )
+            item["applied"] = True
+        return
+    if BROAD_DELTA_GAMMA == 0.0 or BROAD_DELTA_CAPTURE_STEP <= 0 or BROAD_DELTA_APPLY_STEP <= 0:
+        return
+    scoped = _scoped_named_params(broad_delta_in_scope)
+    if step == BROAD_DELTA_CAPTURE_STEP and broad_delta_state is None:
+        broad_delta_state = {name: p.detach().clone() for name, p in scoped}
+        print0(f"broad_delta captured step:{step} tensors:{len(scoped)}", console=True)
+        return
+    if step != BROAD_DELTA_APPLY_STEP or broad_delta_applied:
+        return
+    if broad_delta_state is None:
+        print0(f"broad_delta skipped step:{step} reason:no_capture", console=True)
+        broad_delta_applied = True
+        return
+    apply_broad_delta_move(
+        step=step,
+        gamma=BROAD_DELTA_GAMMA,
+        state=broad_delta_state,
+        scoped=scoped,
+        label="broad_delta",
+    )
+    broad_delta_applied = True
+
+@torch.no_grad()
+def apply_broad_delta_move(step: int, gamma: float, state: dict[str, Tensor], scoped, label: str):
+    delta_sq = torch.zeros((), device=device)
+    moved_sq = torch.zeros((), device=device)
+    clipped_count = 0
+    group_stats = {}
+    for name, p in scoped:
+        if name not in state:
+            continue
+        delta = p.detach() - state[name]
+        move = delta * gamma
+        param_norm = p.detach().float().norm().clamp_min(1e-12)
+        if BROAD_DELTA_MAX_MOVE_RATIO > 0.0:
+            max_move = BROAD_DELTA_MAX_MOVE_RATIO * param_norm
+            move_norm = move.float().norm()
+            if move_norm > max_move:
+                move.mul_(max_move / (move_norm + 1e-12))
+                clipped_count += 1
+        move_sq = move.float().square().sum()
+        delta_sq_i = delta.float().square().sum()
+        group = trail_delta_diag_group(name, p)
+        stats = group_stats.setdefault(
+            group,
+            {
+                "count": 0,
+                "delta_sq": torch.zeros((), device=device),
+                "moved_sq": torch.zeros((), device=device),
+                "max_move_rel": -1.0,
+                "max_name": "",
+            },
+        )
+        move_rel = float((move_sq.sqrt() / param_norm).item())
+        stats["count"] += 1
+        stats["delta_sq"] += delta_sq_i
+        stats["moved_sq"] += move_sq
+        if move_rel > stats["max_move_rel"]:
+            stats["max_move_rel"] = move_rel
+            stats["max_name"] = name
+        p.add_(move)
+        moved_sq += move_sq
+        delta_sq += delta_sq_i
+    print0(
+        f"{label} step:{step} gamma:{gamma:g} "
+        + f"delta_norm:{delta_sq.sqrt().item():.6f} moved_norm:{moved_sq.sqrt().item():.6f} "
+        + f"clipped:{clipped_count}",
+        console=True,
+    )
+    group_parts = []
+    for group in ("adam", "ov", "muon_other", "embed"):
+        stats = group_stats.get(group)
+        if stats is None:
+            continue
+        group_parts.append(
+            f"{group}:count={stats['count']} "
+            + f"delta_norm={stats['delta_sq'].sqrt().item():.6f} "
+            + f"moved_norm={stats['moved_sq'].sqrt().item():.6f} "
+            + f"max_move_rel={stats['max_move_rel']:.6g} "
+            + f"max_tensor={stats['max_name']}"
+        )
+    if group_parts:
+        print0(f"{label}_groups " + " | ".join(group_parts), console=True)
+
+@torch.no_grad()
+def maybe_update_final_readout_anchor(step: int):
+    global final_readout_state
+    if (FINAL_READOUT_ALPHA == 0.0 and not FINAL_READOUT_LINESEARCH_ALPHAS.strip()) or FINAL_READOUT_ANCHOR_STEP <= 0:
+        return
+    if step != FINAL_READOUT_ANCHOR_STEP or final_readout_state is not None:
+        return
+    scoped = _scoped_named_params(final_readout_in_scope)
+    final_readout_state = {name: p.detach().clone() for name, p in scoped}
+    print0(f"final_readout captured step:{step} tensors:{len(scoped)}", console=True)
+
+@torch.no_grad()
+def maybe_apply_final_readout(step: int):
+    global final_readout_applied
+    if (FINAL_READOUT_ALPHA == 0.0 and not FINAL_READOUT_LINESEARCH_ALPHAS.strip()) or final_readout_applied:
+        return
+    if step != FINAL_READOUT_APPLY_STEP:
+        return
+    if final_readout_state is None:
+        print0(f"final_readout skipped step:{step} reason:no_anchor", console=True)
+        final_readout_applied = True
+        return
+    scoped = _scoped_named_params(final_readout_in_scope)
+
+    def apply_alpha(alpha: float):
+        delta_sq = torch.zeros((), device=device)
+        moved_sq = torch.zeros((), device=device)
+        clipped_count = 0
+        applied = []
+        for name, p in scoped:
+            if name not in final_readout_state:
+                continue
+            delta = final_readout_state[name] - p.detach()
+            move = delta * alpha
+            if FINAL_READOUT_MAX_MOVE_RATIO > 0.0:
+                max_move = FINAL_READOUT_MAX_MOVE_RATIO * p.detach().float().norm().clamp_min(1e-12)
+                move_norm = move.float().norm()
+                if move_norm > max_move:
+                    move.mul_(max_move / (move_norm + 1e-12))
+                    clipped_count += 1
+            p.add_(move.to(dtype=p.dtype))
+            delta_sq += delta.float().square().sum()
+            moved_sq += move.float().square().sum()
+            applied.append((p, move))
+        return applied, delta_sq, moved_sq, clipped_count
+
+    def revert_alpha(applied):
+        for p, move in reversed(applied):
+            p.sub_(move.to(dtype=p.dtype))
+
+    chosen_alpha = FINAL_READOUT_ALPHA
+    line_scores = []
+    if FINAL_READOUT_SWEEP_ALPHAS.strip():
+        if step != train_steps:
+            raise RuntimeError("final_readout val sweep is only supported at the final train step")
+        sweep_alphas = [
+            float(part.strip())
+            for part in FINAL_READOUT_SWEEP_ALPHAS.split(",")
+            if part.strip()
+        ]
+        for alpha in sweep_alphas:
+            applied, delta_sq, moved_sq, clipped_count = apply_alpha(alpha)
+            val = _macro_val_loss()
+            revert_alpha(applied)
+            print0(
+                f"final_readout sweep alpha:{alpha:g} val:{val:.5f} "
+                + f"delta_norm:{delta_sq.sqrt().item():.6f} "
+                + f"moved_norm:{moved_sq.sqrt().item():.6f} clipped:{clipped_count}",
+                console=True,
+            )
+
+    if FINAL_READOUT_LINESEARCH_ALPHAS.strip():
+        if step != train_steps:
+            raise RuntimeError("final_readout line search is only supported at the final train step")
+        alphas = [
+            float(part.strip())
+            for part in FINAL_READOUT_LINESEARCH_ALPHAS.split(",")
+            if part.strip()
+        ]
+        inputs, targets = next(train_loader)
+        num_microbatches = min(FINAL_READOUT_LINESEARCH_MICROBATCHES, len(inputs) // mbs)
+        calib_batches = [
+            (inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs])
+            for i in range(num_microbatches)
+        ]
+        best_score = None
+        for alpha in alphas:
+            applied, _delta_sq, _moved_sq, _clipped_count = apply_alpha(alpha)
+            score, calib_mean = _macro_score_calib(calib_batches)
+            revert_alpha(applied)
+            line_scores.append((alpha, score, calib_mean))
+            if best_score is None or score < best_score:
+                best_score = score
+                chosen_alpha = alpha
+
+    applied, delta_sq, moved_sq, clipped_count = apply_alpha(chosen_alpha)
+    final_readout_applied = True
+    if line_scores:
+        print0(
+            "final_readout line_search "
+            + " ".join(
+                f"alpha:{alpha:g}/score:{score:.8f}/mean:{calib_mean:.8f}"
+                for alpha, score, calib_mean in line_scores
+            )
+            + f" chosen:{chosen_alpha:g}",
+            console=True,
+        )
+    print0(
+        f"final_readout applied step:{step} anchor_step:{FINAL_READOUT_ANCHOR_STEP} "
+        + f"alpha:{chosen_alpha:g} delta_norm:{delta_sq.sqrt().item():.6f} "
+        + f"moved_norm:{moved_sq.sqrt().item():.6f} clipped:{clipped_count}",
+        console=True,
+    )
+
+@torch.no_grad()
+def maybe_apply_trail_delta_step(step: int):
+    global trail_delta_state, trail_delta_last_step, trail_delta_momentum_state, trail_delta_apply_count
+    if TRAIL_DELTA_GAMMA == 0.0 or TRAIL_DELTA_START_STEP <= 0:
+        return
+    if step < TRAIL_DELTA_START_STEP or step > TRAIL_DELTA_END_STEP:
+        return
+    if TRAIL_DELTA_INTERVAL <= 0:
+        raise RuntimeError("TRAIL_DELTA_INTERVAL must be positive")
+    scoped = [
+        (name, p)
+        for name, p in model.named_parameters()
+        if torch.is_floating_point(p) and trail_delta_in_scope(name, p)
+    ]
+    if trail_delta_state is None:
+        trail_delta_state = {name: p.detach().clone() for name, p in scoped}
+        trail_delta_last_step = step
+        print0(f"trail_delta captured step:{step}", console=True)
+        return
+    if step - trail_delta_last_step < TRAIL_DELTA_INTERVAL:
+        return
+    gamma = TRAIL_DELTA_GAMMA_FIRST if trail_delta_apply_count == 0 else TRAIL_DELTA_GAMMA_FINAL
+    moved_sq = torch.zeros((), device=device)
+    delta_sq = torch.zeros((), device=device)
+    clipped_count = 0
+    adam_damped_count = 0
+    muon_damped_count = 0
+    lookahead_touched_count = 0
+    group_stats = {}
+    if TRAIL_DELTA_MOMENTUM_BETA != 0.0 and trail_delta_momentum_state is None:
+        trail_delta_momentum_state = {
+            name: torch.zeros_like(p.detach())
+            for name, p in scoped
+        }
+    for name, p in scoped:
+        delta = p.detach() - trail_delta_state[name]
+        if TRAIL_DELTA_MOMENTUM_BETA != 0.0:
+            prev_delta = trail_delta_momentum_state[name]
+            delta = delta + TRAIL_DELTA_MOMENTUM_BETA * prev_delta
+            trail_delta_momentum_state[name] = delta.detach().clone()
+        move = delta * gamma
+        param_norm = p.detach().float().norm().clamp_min(1e-12)
+        if TRAIL_DELTA_MAX_MOVE_RATIO > 0.0:
+            max_move = TRAIL_DELTA_MAX_MOVE_RATIO * param_norm
+            move_norm = move.float().norm()
+            if move_norm > max_move:
+                move.mul_(max_move / (move_norm + 1e-12))
+                clipped_count += 1
+        move_sq = move.float().square().sum()
+        delta_sq_i = delta.float().square().sum()
+        group = trail_delta_diag_group(name, p)
+        stats = group_stats.get(group)
+        if stats is None:
+            stats = {
+                "count": 0,
+                "delta_sq": torch.zeros((), device=device),
+                "moved_sq": torch.zeros((), device=device),
+                "max_move_rel": -1.0,
+                "max_name": "",
+            }
+            group_stats[group] = stats
+        move_rel = float((move_sq.sqrt() / param_norm).item())
+        stats["count"] += 1
+        stats["delta_sq"] += delta_sq_i
+        stats["moved_sq"] += move_sq
+        if move_rel > stats["max_move_rel"]:
+            stats["max_move_rel"] = move_rel
+            stats["max_name"] = name
+        p.add_(move)
+        if TRAIL_DELTA_ADAM_MOMENT_DAMP != 1.0:
+            adam_state = optimizer1.state.get(p)
+            if adam_state is not None and "exp_avg" in adam_state:
+                adam_state["exp_avg"].mul_(TRAIL_DELTA_ADAM_MOMENT_DAMP)
+                adam_damped_count += 1
+        if TRAIL_DELTA_MUON_MOMENT_DAMP != 1.0:
+            muon_state = optimizer2.state.get(p)
+            if muon_state is not None and "momentum" in muon_state:
+                muon_state["momentum"].mul_(TRAIL_DELTA_MUON_MOMENT_DAMP)
+                muon_damped_count += 1
+        if TRAIL_DELTA_SYNC_NESTEROV_STATE or TRAIL_DELTA_LOOKAHEAD_INJECT != 0.0:
+            ema_state = optimizers[0].state.get(p)
+            if ema_state is not None and "prev_params" in ema_state and "lookahead_buffer" in ema_state:
+                if TRAIL_DELTA_LOOKAHEAD_INJECT != 0.0:
+                    ema_state["lookahead_buffer"][0].add_(move.to(dtype=ema_state["lookahead_buffer"][0].dtype), alpha=TRAIL_DELTA_LOOKAHEAD_INJECT)
+                if TRAIL_DELTA_SYNC_NESTEROV_STATE:
+                    ema_state["prev_params"][0].copy_(p)
+                    ema_state["prev_params"] = (ema_state["prev_params"][0], optimizers[0].it)
+                lookahead_touched_count += 1
+        moved_sq += move_sq
+        delta_sq += delta_sq_i
+    trail_delta_state = {name: p.detach().clone() for name, p in scoped}
+    trail_delta_last_step = step
+    trail_delta_apply_count += 1
+    print0(
+        f"trail_delta step:{step} gamma:{gamma:g} "
+        + f"delta_norm:{delta_sq.sqrt().item():.6f} moved_norm:{moved_sq.sqrt().item():.6f} "
+        + f"clipped:{clipped_count} adam_damped:{adam_damped_count} muon_damped:{muon_damped_count} "
+        + f"lookahead_touched:{lookahead_touched_count}",
+        console=True,
+    )
+    group_parts = []
+    for group in ("adam", "ov", "muon_other", "embed"):
+        stats = group_stats.get(group)
+        if stats is None:
+            continue
+        group_parts.append(
+            f"{group}:count={stats['count']} "
+            + f"delta_norm={stats['delta_sq'].sqrt().item():.6f} "
+            + f"moved_norm={stats['moved_sq'].sqrt().item():.6f} "
+            + f"max_move_rel={stats['max_move_rel']:.6g} "
+            + f"max_tensor={stats['max_name']}"
+        )
+    if group_parts:
+        print0("trail_delta_groups " + " | ".join(group_parts), console=True)
+
+saved_checkpoint_steps = set()
+should_exit_after_checkpoint = False
+
+def checkpoint_path_for_step(step: int) -> Path:
+    return CHECKPOINT_DIR / f"{CHECKPOINT_PREFIX}_step{step}.pt"
+
+def build_checkpoint_state(step: int) -> dict:
+    return {
+        "step": step,
+        "seed": SEED,
+        "model": model.state_dict(),
+        "ema_optimizer": optimizers[0].state_dict(),
+        "ema_nesterov_it": optimizers[0].it,
+        "ema_nesterov_lookahead_status": optimizers[0].lookahead_status,
+        "ema_nesterov_current_lookahead_stepsize": optimizers[0].current_lookahead_stepsize,
+        "inner_optimizers": [opt.state_dict() for opt in optimizers[0].inner_optimizer],
+        "optimizer2_step_count": optimizer2.step_count,
+        "trail_delta_state": trail_delta_state,
+        "trail_delta_last_step": trail_delta_last_step,
+        "trail_delta_momentum_state": trail_delta_momentum_state,
+        "trail_delta_apply_count": trail_delta_apply_count,
+        "broad_delta_state": broad_delta_state,
+        "broad_delta_applied": broad_delta_applied,
+        "final_readout_state": final_readout_state,
+        "final_readout_applied": final_readout_applied,
+        "torch_rng_state": torch.get_rng_state(),
+        "cuda_rng_state": torch.cuda.get_rng_state(device),
+    }
+
+def maybe_save_checkpoint(step: int):
+    global should_exit_after_checkpoint
+    if step not in SAVE_CHECKPOINT_STEPS or step in saved_checkpoint_steps:
+        return
+    if dist.get_rank() != 0:
+        return
+    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    path = checkpoint_path_for_step(step)
+    torch.save(build_checkpoint_state(step), path)
+    saved_checkpoint_steps.add(step)
+    print0(f"saved_checkpoint step:{step} path:{path}", console=True)
+    if EXIT_AFTER_SAVE_CHECKPOINT and (
+        EXIT_AFTER_SAVE_CHECKPOINT_STEP <= 0 or step >= EXIT_AFTER_SAVE_CHECKPOINT_STEP
+    ):
+        should_exit_after_checkpoint = True
+
+def reapply_runtime_muon_history_config():
+    for group in optimizer2.param_groups:
+        group.update(dict(
+            muon_history_steps=MUON_HISTORY_STEPS,
+            muon_history_steps_late=MUON_HISTORY_STEPS_LATE,
+            muon_history_steps_switch_step=MUON_HISTORY_STEPS_SWITCH_STEP,
+            muon_history_blend=MUON_HISTORY_BLEND,
+            muon_history_blend_late=MUON_HISTORY_BLEND_LATE,
+            muon_history_blend_switch_step=MUON_HISTORY_BLEND_SWITCH_STEP,
+            muon_history_lookahead=MUON_HISTORY_LOOKAHEAD,
+            muon_history_min_cos=MUON_HISTORY_MIN_COS,
+            muon_history_min_cos_late=MUON_HISTORY_MIN_COS_LATE,
+            muon_history_min_cos_decay_start_step=MUON_HISTORY_MIN_COS_DECAY_START_STEP,
+            muon_history_min_cos_decay_end_step=MUON_HISTORY_MIN_COS_DECAY_END_STEP,
+            muon_history_max_delta=MUON_HISTORY_MAX_DELTA,
+            muon_history_adaptive_steps=MUON_HISTORY_ADAPTIVE_STEPS,
+            muon_history_adapt_margin=MUON_HISTORY_ADAPT_MARGIN,
+            muon_history_adapt_delta_ratio=MUON_HISTORY_ADAPT_DELTA_RATIO,
+            muon_history_decay_start_step=MUON_HISTORY_DECAY_START_STEP,
+            muon_history_decay_end_step=MUON_HISTORY_DECAY_END_STEP,
+            muon_history_final_blend_mult=MUON_HISTORY_FINAL_BLEND_MULT,
+            muon_history_steps_late_ramp_start_step=MUON_HISTORY_STEPS_LATE_RAMP_START_STEP,
+            muon_history_steps_late_ramp_end_step=MUON_HISTORY_STEPS_LATE_RAMP_END_STEP,
+        ))
+
+def load_checkpoint_state(path: str) -> int:
+    global trail_delta_state, trail_delta_last_step, trail_delta_momentum_state, trail_delta_apply_count
+    global broad_delta_state, broad_delta_applied, final_readout_state, final_readout_applied
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+    if checkpoint.get("seed") != SEED:
+        raise RuntimeError(f"checkpoint seed {checkpoint.get('seed')} does not match run seed {SEED}")
+    model.load_state_dict(checkpoint["model"])
+    optimizers[0].load_state_dict(checkpoint["ema_optimizer"])
+    step = int(checkpoint["step"])
+    optimizers[0].it = int(checkpoint.get("ema_nesterov_it", step))
+    optimizers[0].lookahead_status = bool(checkpoint.get("ema_nesterov_lookahead_status", False))
+    optimizers[0].current_lookahead_stepsize = float(checkpoint.get("ema_nesterov_current_lookahead_stepsize", 0.0))
+    for opt, opt_state in zip(optimizers[0].inner_optimizer, checkpoint["inner_optimizers"]):
+        opt.load_state_dict(opt_state)
+    optimizer2.step_count = int(checkpoint["optimizer2_step_count"])
+    reapply_runtime_muon_history_config()
+    trail_delta_state = checkpoint.get("trail_delta_state")
+    trail_delta_last_step = checkpoint.get("trail_delta_last_step")
+    trail_delta_momentum_state = checkpoint.get("trail_delta_momentum_state")
+    trail_delta_apply_count = int(checkpoint.get("trail_delta_apply_count", 0))
+    broad_delta_state = checkpoint.get("broad_delta_state")
+    broad_delta_applied = bool(checkpoint.get("broad_delta_applied", False))
+    final_readout_state = checkpoint.get("final_readout_state")
+    final_readout_applied = bool(checkpoint.get("final_readout_applied", False))
+    torch.set_rng_state(checkpoint["torch_rng_state"].cpu())
+    torch.cuda.set_rng_state(checkpoint["cuda_rng_state"].cpu(), device)
+    print0(f"loaded_checkpoint step:{step} path:{path}", console=True)
+    print0("reapplied_runtime_muon_history_config after checkpoint load", console=True)
+    return step
+
+@torch.no_grad()
+def maybe_apply_state_refresh_step(step: int):
+    for item in state_refresh_schedule:
+        if item["applied"] or step != item["step"]:
+            continue
+        modes = item["modes"]
+        stats = {
+            "ema_prev": 0,
+            "ema_lookahead": 0,
+            "adam_exp_avg": 0,
+            "adam_exp_avg_sq": 0,
+            "muon_momentum": 0,
+            "muon_second": 0,
+            "muon_exp_avg_sq": 0,
+            "soap": 0,
+        }
+        if "checkpoint_roundtrip" in modes:
+            CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+            path = CHECKPOINT_DIR / f"{CHECKPOINT_PREFIX}_state_refresh_step{step}.pt"
+            if dist.get_rank() == 0:
+                torch.save(build_checkpoint_state(step), path)
+            dist.barrier()
+            load_checkpoint_state(str(path))
+            dist.barrier()
+            print0(f"state_refresh checkpoint_roundtrip step:{step} path:{path}", console=True)
+        for mode in modes:
+            if mode == "checkpoint_roundtrip":
+                continue
+            if mode in ("ema_prev", "ema_all"):
+                for group in optimizers[0].param_groups:
+                    for p in group["params"]:
+                        state = optimizers[0].state[p]
+                        if "prev_params" in state:
+                            state["prev_params"] = (state["prev_params"][0].copy_(p), optimizers[0].it)
+                            stats["ema_prev"] += 1
+            if mode in ("ema_lookahead_zero", "ema_lookahead_damp", "ema_all"):
+                factor = 0.0 if mode in ("ema_lookahead_zero", "ema_all") else STATE_REFRESH_LOOKAHEAD_DAMP
+                for group in optimizers[0].param_groups:
+                    for p in group["params"]:
+                        state = optimizers[0].state[p]
+                        if "lookahead_buffer" in state:
+                            state["lookahead_buffer"][0].mul_(factor)
+                            state["lookahead_buffer"] = (state["lookahead_buffer"][0], optimizers[0].it)
+                            stats["ema_lookahead"] += 1
+            if mode in ("adam_exp_avg_damp", "adam_all_damp"):
+                for state in optimizer1.state.values():
+                    if "exp_avg" in state:
+                        state["exp_avg"].mul_(STATE_REFRESH_ADAM_EXP_AVG_DAMP)
+                        stats["adam_exp_avg"] += 1
+            if mode in ("adam_exp_avg_sq_damp", "adam_all_damp"):
+                for state in optimizer1.state.values():
+                    if "exp_avg_sq" in state:
+                        state["exp_avg_sq"].mul_(STATE_REFRESH_ADAM_EXP_AVG_SQ_DAMP)
+                        stats["adam_exp_avg_sq"] += 1
+            if mode in ("muon_momentum_damp", "muon_all_damp"):
+                for state in optimizer2.state.values():
+                    if "momentum" in state:
+                        state["momentum"].mul_(STATE_REFRESH_MUON_MOMENTUM_DAMP)
+                        stats["muon_momentum"] += 1
+            if mode in ("muon_second_damp", "muon_all_damp"):
+                for state in optimizer2.state.values():
+                    if "second_moment" in state:
+                        state["second_moment"].mul_(STATE_REFRESH_MUON_SECOND_DAMP)
+                        stats["muon_second"] += 1
+                    if "exp_avg_sq" in state:
+                        state["exp_avg_sq"].mul_(STATE_REFRESH_MUON_SECOND_DAMP)
+                        stats["muon_exp_avg_sq"] += 1
+            if mode == "soap_reset":
+                for state in optimizer2.state.values():
+                    touched = False
+                    for key in ("exp_avg_sq", "row_gg", "col_gg"):
+                        if key in state:
+                            state[key].zero_()
+                            touched = True
+                    if "q_row" in state:
+                        state["q_row"] = None
+                        touched = True
+                    if "q_col" in state:
+                        state["q_col"] = None
+                        touched = True
+                    if "soap_step" in state:
+                        state["soap_step"] = 0
+                        touched = True
+                    if touched:
+                        stats["soap"] += 1
+        item["applied"] = True
+        stats_str = " ".join(f"{key}:{value}" for key, value in stats.items() if value)
+        print0(f"state_refresh step:{step} modes:{','.join(modes)} {stats_str}", console=True)
+
+def align_train_loader_to_step(step: int):
+    if step <= 0:
+        return
+    print0(f"align_dataloader begin skip_steps:{step}", console=True)
+    for _ in range(step):
+        next(train_loader)
+    print0(f"align_dataloader done skip_steps:{step}", console=True)
+
+def _checkpoint_model_state(path: str) -> dict:
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    return checkpoint["model"]
+
+@torch.no_grad()
+def _macro_load_candidate(base_state: dict, delta1: dict, delta2: dict, alpha: Tensor, groups_by_name: dict[str, str] | None = None):
+    model.load_state_dict(base_state)
+    if groups_by_name is None:
+        gamma1, gamma2, beta = [float(x) for x in alpha.tolist()]
+        coeff_by_name = {
+            name: (gamma1 + gamma2 * beta, gamma2)
+            for name in delta1
+        }
+    else:
+        vals = [float(x) for x in alpha.tolist()]
+        gamma1_by_group = {"adam": vals[0], "ov": vals[1], "muon_other": vals[2]}
+        gamma2_by_group = {"adam": vals[3], "ov": vals[4], "muon_other": vals[5]}
+        beta = vals[6]
+        coeff_by_name = {}
+        for name in delta1:
+            group = groups_by_name[name]
+            gamma1 = gamma1_by_group[group]
+            gamma2 = gamma2_by_group[group]
+            coeff_by_name[name] = (gamma1 + gamma2 * beta, gamma2)
+    params = dict(model.named_parameters())
+    for name, d1 in delta1.items():
+        p = params[name]
+        coeff1, coeff2 = coeff_by_name[name]
+        move = coeff1 * d1 + coeff2 * delta2[name]
+        if TRAIL_DELTA_MAX_MOVE_RATIO > 0.0:
+            max_move = TRAIL_DELTA_MAX_MOVE_RATIO * p.detach().float().norm().clamp_min(1e-12)
+            move_norm = move.float().norm()
+            if move_norm > max_move:
+                move = move * (max_move / (move_norm + 1e-12))
+        p.add_(move.to(dtype=p.dtype))
+
+@torch.no_grad()
+def _macro_score_calib(calib_batches) -> tuple[float, float]:
+    model.eval()
+    losses = []
+    for inputs, targets in calib_batches:
+        losses.append(model(inputs, targets).detach().float())
+    vals = torch.stack(losses)
+    score = vals.mean() + 0.25 * vals.std(unbiased=False)
+    return float(score.item()), float(vals.mean().item())
+
+@torch.no_grad()
+def _macro_val_loss() -> float:
+    model.eval()
+    val_loss = torch.zeros((), device=device)
+    assert len(val_inputs) % mbs == 0
+    for i in range(len(val_inputs) // mbs):
+        val_loss += model(val_inputs[i*mbs:(i+1)*mbs], val_targets[i*mbs:(i+1)*mbs])
+    dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
+    val_loss /= val_tokens
+    return float(val_loss.item())
+
+@torch.no_grad()
+def run_macro_cem():
+    if dist.get_world_size() != 1:
+        raise RuntimeError("MACRO_CEM_MODE currently expects world_size=1")
+    if not (MACRO_REF_T0 and MACRO_REF_T1 and MACRO_REF_T2):
+        raise RuntimeError("MACRO_CEM_MODE requires MACRO_REF_T0, MACRO_REF_T1, and MACRO_REF_T2")
+
+    print0("macro_cem loading checkpoint states", console=True)
+    state0 = _checkpoint_model_state(MACRO_REF_T0)
+    state1 = _checkpoint_model_state(MACRO_REF_T1)
+    state2 = _checkpoint_model_state(MACRO_REF_T2)
+    params = dict(model.named_parameters())
+    groups_by_name = None
+    if MACRO_CEM_GROUP_MODE:
+        groups_by_name = {}
+        scoped_names = []
+        group_counts = {"adam": 0, "ov": 0, "muon_other": 0}
+        for name, p in model.named_parameters():
+            if not torch.is_floating_point(p) or not trail_delta_in_scope(name, p):
+                continue
+            group = macro_cem_group(name, p)
+            if group is None:
+                continue
+            scoped_names.append(name)
+            groups_by_name[name] = group
+            group_counts[group] += 1
+        print0(f"macro_cem group_counts:{group_counts}", console=True)
+    else:
+        scoped_names = [
+            name for name, p in model.named_parameters()
+            if torch.is_floating_point(p) and trail_delta_in_scope(name, p)
+        ]
+    delta1 = {
+        name: (state1[name].float() - state0[name].float()).to(device)
+        for name in scoped_names
+    }
+    delta2 = {
+        name: (state2[name].float() - state1[name].float()).to(device)
+        for name in scoped_names
+    }
+    del state0, state1
+
+    inputs, targets = next(train_loader)
+    num_microbatches = min(MACRO_CEM_CALIB_MICROBATCHES, len(inputs) // mbs)
+    calib_batches = [
+        (inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs])
+        for i in range(num_microbatches)
+    ]
+
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(MACRO_CEM_SEED)
+    if MACRO_CEM_GROUP_MODE:
+        mu = torch.tensor([-0.05, -0.05, -0.05, -0.05, -0.05, -0.05, 1.0], dtype=torch.float32)
+        sigma = torch.tensor([0.0125, 0.0125, 0.0125, 0.0125, 0.0125, 0.0125, 0.25], dtype=torch.float32)
+        lo = torch.tensor([-0.09, -0.09, -0.09, -0.09, -0.09, -0.09, 0.25], dtype=torch.float32)
+        hi = torch.tensor([-0.005, -0.005, -0.005, -0.005, -0.005, -0.005, 1.75], dtype=torch.float32)
+        floor = torch.tensor([0.003, 0.003, 0.003, 0.003, 0.003, 0.003, 0.05], dtype=torch.float32)
+    else:
+        mu = torch.tensor([-0.05, -0.05, 1.0], dtype=torch.float32)
+        sigma = torch.tensor([0.0125, 0.0125, 0.25], dtype=torch.float32)
+        lo = torch.tensor([-0.08, -0.08, 0.25], dtype=torch.float32)
+        hi = torch.tensor([-0.02, -0.02, 1.75], dtype=torch.float32)
+        floor = torch.tensor([0.003, 0.003, 0.05], dtype=torch.float32)
+
+    hand = mu.clone()
+    _macro_load_candidate(state2, delta1, delta2, hand, groups_by_name)
+    hand_score, hand_mean = _macro_score_calib(calib_batches)
+    hand_val = _macro_val_loss()
+    print0(
+        f"macro_cem hand alpha:{hand.tolist()} score:{hand_score:.8f} "
+        + f"calib_mean:{hand_mean:.8f} val:{hand_val:.5f}",
+        console=True,
+    )
+
+    for cem_iter in range(MACRO_CEM_ITERS):
+        candidates = [mu.clamp(lo, hi)]
+        while len(candidates) < MACRO_CEM_SAMPLES:
+            sample = mu + sigma * torch.randn(mu.numel(), generator=generator)
+            candidates.append(sample.clamp(lo, hi))
+        scored = []
+        for alpha in candidates:
+            _macro_load_candidate(state2, delta1, delta2, alpha, groups_by_name)
+            score, calib_mean = _macro_score_calib(calib_batches)
+            scored.append((score, calib_mean, alpha.clone()))
+            print0(
+                f"macro_cem iter:{cem_iter} alpha:{[round(float(x), 6) for x in alpha.tolist()]} "
+                + f"score:{score:.8f} calib_mean:{calib_mean:.8f}",
+                console=True,
+            )
+        scored.sort(key=lambda item: item[0])
+        elites = scored[:MACRO_CEM_ELITES]
+        elite_alphas = torch.stack([item[2] for item in elites])
+        mu = elite_alphas.mean(dim=0).clamp(lo, hi)
+        sigma = (0.7 * sigma + 0.3 * elite_alphas.std(dim=0, unbiased=False)).clamp_min(floor)
+        print0(
+            f"macro_cem iter:{cem_iter} elite_best:{elites[0][0]:.8f} "
+            + f"mu:{[round(float(x), 6) for x in mu.tolist()]} "
+            + f"sigma:{[round(float(x), 6) for x in sigma.tolist()]}",
+            console=True,
+        )
+
+    _macro_load_candidate(state2, delta1, delta2, mu, groups_by_name)
+    final_score, final_mean = _macro_score_calib(calib_batches)
+    final_val = _macro_val_loss()
+    print0(
+        f"macro_cem selected alpha:{[round(float(x), 8) for x in mu.tolist()]} "
+        + f"score:{final_score:.8f} calib_mean:{final_mean:.8f} val:{final_val:.5f}",
+        console=True,
+    )
+
+# learning rate schedule: stable then decay
+def _active_schedule_steps(step):
+    schedule_steps = float(FINAL_SCHEDULE_STEPS)
+    if TAIL_SCHEDULE_RAMP_START_STEP > 0 and TAIL_SCHEDULE_RAMP_END_STEP > TAIL_SCHEDULE_RAMP_START_STEP:
+        if step >= TAIL_SCHEDULE_RAMP_END_STEP:
+            schedule_steps = float(TAIL_SCHEDULE_STEPS)
+        elif step >= TAIL_SCHEDULE_RAMP_START_STEP:
+            frac = (step - TAIL_SCHEDULE_RAMP_START_STEP) / max(TAIL_SCHEDULE_RAMP_END_STEP - TAIL_SCHEDULE_RAMP_START_STEP, 1)
+            schedule_steps = float(FINAL_SCHEDULE_STEPS) + frac * float(TAIL_SCHEDULE_STEPS - FINAL_SCHEDULE_STEPS)
+    elif TAIL_SCHEDULE_SWITCH_STEP > 0 and step >= TAIL_SCHEDULE_SWITCH_STEP:
+        schedule_steps = float(TAIL_SCHEDULE_STEPS)
+    if TAIL_SCHEDULE_STAGE2_SWITCH_STEP > 0 and step >= TAIL_SCHEDULE_STAGE2_SWITCH_STEP:
+        schedule_steps = float(TAIL_SCHEDULE_STAGE2_STEPS)
+    return schedule_steps
+
+def _lr(step, initial_lr, power_c, power=1.0):
+    t_end = _active_schedule_steps(step)
+    flat_lr = initial_lr
+    downward_lr = power_c * max(0.0, t_end - step) ** power
+    return min(flat_lr, downward_lr)
+
+# v49: v15 Muon mu schedule (warmup 0.85->0.95 over 300 steps, cooldown 0.95->0.85 over last 50)
+_MU_MIN = 0.85
+_MU_MAX = 0.95
+_MU_WARMUP_STEPS = 300
+_MU_COOLDOWN_STEPS = MU_COOLDOWN_STEPS
+
+def _muon_mu_at_step(step, train_steps):
+    cd_start = train_steps - _MU_COOLDOWN_STEPS
+    if step < _MU_WARMUP_STEPS:
+        frac = step / max(_MU_WARMUP_STEPS, 1)
+        return _MU_MIN + frac * (_MU_MAX - _MU_MIN)
+    elif step > cd_start:
+        frac = (step - cd_start) / max(_MU_COOLDOWN_STEPS, 1)
+        return _MU_MAX - frac * (_MU_MAX - _MU_MIN)
+    else:
+        return _MU_MAX
+
+def set_hparams(step):
+    progress = step / _active_schedule_steps(step)
+    assert 0 <= progress < 1
+    mu = _muon_mu_at_step(step, FINAL_TRAIN_STEPS)
+    for opt in optimizers[0].inner_optimizer:
+        for group in opt.param_groups:
+            group["lr"] = _lr(step, group["initial_lr"], group["power_c"], FINAL_LR_POWER)
+    for group in optimizer2.param_groups:
+        group["mu"] = mu
+
+
+
+
+########################################
+#        Training and Validation       #
+########################################
+
+start_step = load_checkpoint_state(LOAD_CHECKPOINT) if LOAD_CHECKPOINT else 0
+if LOAD_CHECKPOINT and ALIGN_DATALOADER_ON_LOAD:
+    align_train_loader_to_step(start_step)
+for p in model.parameters():
+    dist.broadcast(p.detach(), 0)
+maybe_apply_trail_delta_step(start_step)
+maybe_apply_state_refresh_step(start_step)
+if MACRO_CEM_MODE:
+    run_macro_cem()
+    dist.destroy_process_group()
+    sys.exit(0)
+# start the clock
+training_time = 0
+dist.barrier()
+t0 = time.perf_counter()
+for step in range(start_step, train_steps + 1):
+
+    # --------------- VALIDATION SECTION -----------------
+    maybe_apply_final_readout(step)
+    maybe_apply_curve_readout(step)
+    should_validate = (
+        step == train_steps
+        or (step > 0 and step % val_regular_interval == 0)
+        or step in extra_val_steps
+    )
+    if should_validate:
+        # stop the clock
+        dist.barrier()
+        training_time += time.perf_counter() - t0
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            assert len(val_inputs) % mbs == 0
+            for i in range(len(val_inputs) // mbs):
+                val_loss += model(val_inputs[i*mbs:(i+1)*mbs], val_targets[i*mbs:(i+1)*mbs])
+        dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
+        val_loss /= val_tokens
+        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.5f} train_time:{training_time:.3f}s"
+               + f" step_avg:{1000*training_time/max(step, 1):.2f}ms", console=True)
+        model.train()
+        maybe_save_checkpoint(step)
+        if should_exit_after_checkpoint:
+            print0(f"exit_after_save_checkpoint step:{step}", console=True)
+            break
+        # start the clock again
+        dist.barrier()
+        t0 = time.perf_counter()
+
+    if step == train_steps:
+        break
+
+    # --------------- TRAINING SECTION -----------------
+    inputs, targets = next(train_loader)
+    # accumulate across microbatches in case we are running with fewer than 8 gpus
+    assert len(inputs) % mbs == 0
+    optimizers[0].nesterov_step()
+    for i in range(len(inputs) // mbs):
+        loss = model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs])
+        # NaN guard: catch divergence the step it happens, not 750 steps later.
+        if not torch.isfinite(loss).all():
+            raise RuntimeError(f"non-finite train loss at step {step} mb {i}: {loss.item()}")
+        loss.backward()
+    for name, p in model.named_parameters():
+        assert p.grad is not None, name
+        dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+    # set optimization hyperparameters and take a step
+    set_hparams(step)
+    for opt in optimizers:
+        opt.step()
+    maybe_apply_broad_delta_step(step + 1)
+    maybe_update_final_readout_anchor(step + 1)
+    if CURVE_READOUT_COLLECT_BEFORE_TRAIL_DELTA:
+        maybe_update_curve_readout_state(step + 1)
+    maybe_apply_trail_delta_step(step + 1)
+    if not CURVE_READOUT_COLLECT_BEFORE_TRAIL_DELTA:
+        maybe_update_curve_readout_state(step + 1)
+    maybe_save_checkpoint(step + 1)
+    if should_exit_after_checkpoint:
+        print0(f"exit_after_save_checkpoint step:{step+1}", console=True)
+        break
+    maybe_apply_state_refresh_step(step + 1)
+    if MUON_HISTORY_DIAG and MUON_HISTORY_DIAG_EVERY > 0 and (
+        (step + 1) % MUON_HISTORY_DIAG_EVERY == 0 or (step + 1) == train_steps
+    ):
+        flush_muon_history_diag(step + 1)
+    model.zero_grad(set_to_none=True)
+    if TRAIN_PROGRESS_INTERVAL > 0 and (step + 1) % TRAIN_PROGRESS_INTERVAL == 0:
+        approx_training_time = training_time + (time.perf_counter() - t0)
+        print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time:.3f}s"
+               + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms", console=True, log=False)
+
+dist.destroy_process_group()
+
+====================================================================================================
+Running PyTorch 2.9.1+cu128 compiled for CUDA 12.8
+Running on device_name=NVIDIA GH200 480GB with world_size=1
+Run UTC timestamp=2026-06-06T22:48:27Z
+Using seed=11
+Experiment=circuit-muon
+Intuition=PR309 (EMA-Nesterov + Aurora) plus Circuit-Muon on attn.v <-> attn.proj: per-head partner-scalar post-whitening (norm-preserving) + trace-only gauge rebalance.
+Muon update linearly changes from Contra Muon to normal Muon, then normal Muon to soft Muon.
+This script retains the PR 274 NorMuon-lite row/column variance normalization and u/w-floor postprocessing.
+MLP and V SOAP stay on all run; V SOAP blend is fixed at 0.95.
+Schedule uses hardcoded PR 287 cooldown constants with train_steps=2830, schedule_steps=2950.
+Using tail_schedule_switch_step=2400
+Using tail_schedule_steps=3050
+Using tail_schedule_ramp_start_step=0
+Using tail_schedule_ramp_end_step=0
+Using tail_schedule_stage2_switch_step=0
+Using tail_schedule_stage2_steps=3050
+Using contra_muon_coeff=-0.2
+Using soft_muon_p=0.1
+Using soft_muon_scale=none
+Using soft_muon_input_norm=frobenius_schatten4
+Using soft_muon_ceil=0.0
+Using contra_hold_end_step=0
+Using contra_to_normal_end_step=2500
+Using normal_to_soft_start_step=2500
+Using normal_to_soft_end_step=3010
+Using muon_history_steps=4
+Using muon_history_steps_late=4
+Using muon_history_steps_switch_step=0
+Using muon_history_blend=0.25
+Using muon_history_blend_late=0.15
+Using muon_history_blend_switch_step=2300
+Using muon_history_lookahead=1.0
+Using muon_history_min_cos=0.25
+Using muon_history_min_cos_late=0.25
+Using muon_history_min_cos_decay_start_step=0
+Using muon_history_min_cos_decay_end_step=0
+Using muon_history_max_delta=0.25
+Using muon_history_adaptive_steps=0
+Using muon_history_adapt_margin=0.02
+Using muon_history_adapt_delta_ratio=1.25
+Using muon_history_diag=0
+Using muon_history_diag_every=250
+Using muon_history_decay_start_step=2300
+Using muon_history_decay_end_step=2750
+Using muon_history_final_blend_mult=0.0
+Using muon_history_scope=all
+Using muon_history_block_min=-1
+Using muon_history_block_max=-1
+Using muon_history_steps_late_scope=all
+Using muon_history_steps_late_ramp_start_step=0
+Using muon_history_steps_late_ramp_end_step=0
+Using circuit_history_steps=0
+Using circuit_history_blend=0.1
+Using circuit_history_lookahead=1.0
+Using circuit_history_min_cos=0.25
+Using circuit_history_max_delta=0.15
+Using circuit_history_start_step=0
+Using circuit_history_scope=both
+Using circuit_history_decay_start_step=2400
+Using circuit_history_decay_end_step=2830
+Using circuit_history_final_blend_mult=0.0
+Using circuit_history_agree_shrink=False
+Using circuit_history_agree_min_scale=0.5
+Using soap_history_steps=0
+Using soap_history_blend=0.1
+Using soap_history_lookahead=1.0
+Using soap_history_min_cos=0.25
+Using soap_history_max_delta=0.15
+Using soap_history_decay_start_step=2400
+Using soap_history_decay_end_step=2830
+Using soap_history_final_blend_mult=0.0
+Using muon_output_history_steps=0
+Using muon_output_history_blend=0.05
+Using muon_output_history_lookahead=1.0
+Using muon_output_history_min_cos=0.25
+Using muon_output_history_max_delta=0.1
+Using muon_output_history_decay_start_step=2400
+Using muon_output_history_decay_end_step=2830
+Using muon_output_history_final_blend_mult=0.0
+Using radial_history_beta=0.0
+Using radial_history_blend=0.0
+Using radial_history_start_step=0
+Using radial_history_end_step=2830
+Using attn_trust_history_beta=0.0
+Using attn_trust_history_blend=0.0
+Using attn_trust_history_start_step=0
+Using attn_trust_history_end_step=2830
+Using muon_output_ema_beta=0.0
+Using muon_output_ema_blend=0.0
+Using muon_output_ema_min_cos=0.25
+Using muon_output_ema_start_step=0
+Using muon_output_ema_end_step=2830
+Using contra_history_steps=0
+Using contra_history_blend=0.1
+Using contra_history_lookahead=1.0
+Using contra_history_min_cos=0.25
+Using contra_history_max_delta=0.15
+Using contra_history_start_step=0
+Using contra_history_end_step=2500
+Using mu=0.95
+Using muon_lr=0.0375
+Using muon_weight_decay=0.025
+Using target_uw=0.3825
+Using soap_target_uw=0.3825
+Using nonsoap_target_uw=0.3825
+Using nor_beta2=1.0
+Using soap_beta2=0.9
+Using soap_precondition_frequency=10
+Using soap_denom_power=0.5
+Using soap_blend=1.0
+Using soap_update_before_use=False
+Using soap_param_mode=mlp_plus_v
+Using attn_soap_denom_floor=0.55
+Using attn_soap_blend=1.0
+Using v_soap_blend=0.95
+Using v_soap_blend_ramp_end_step=0
+Using attn_early_trust_floor=0.45
+Using attn_early_trust_cap=0.85
+Using attn_trust_floor_end_step=1375
+Using attn_trust_floor_fade_end_step=1625
+Using attn_trust_min_agree=0.2
+Using attn_trust_min_grad_align=0.0
+Using attn_trust_power=1.0
+Using attn_soap_fade_start_step=1000000000
+Using attn_soap_fade_end_step=1000000000
+Using no_contra_param=
+Using no_softmuon_param=
+Using radial_outward_scale=0.5
+Using radial_inward_scale=1.0
+Using circuit_ov_damping=0.001  head_dim=128
+Using dense_eval_start=2830
+Using dense_eval_end=2830
+Using dense_eval_stride=10
+Using ema_nesterov_rest_steps=1880
+Using mu_cooldown_steps=100
+Using trail_delta_start_step=2630
+Using trail_delta_end_step=2830
+Using trail_delta_interval=100
+Using trail_delta_gamma=-0.08
+Using trail_delta_gamma_first=-0.04
+Using trail_delta_gamma_final=-0.12
+Using trail_delta_scope=nonembed
+Using trail_delta_max_move_ratio=0.0
+Using trail_delta_momentum_beta=0.75
+Using trail_delta_sync_nesterov_state=False
+Using trail_delta_lookahead_inject=0.0
+Using trail_delta_adam_moment_damp=1.0
+Using trail_delta_muon_moment_damp=1.0
+Using state_refresh_schedule=
+Using state_refresh_adam_exp_avg_damp=0.0
+Using state_refresh_adam_exp_avg_sq_damp=1.0
+Using state_refresh_muon_momentum_damp=0.0
+Using state_refresh_muon_second_damp=1.0
+Using state_refresh_lookahead_damp=0.0
+Using broad_delta_capture_step=0
+Using broad_delta_apply_step=0
+Using broad_delta_gamma=0.0
+Using broad_delta_scope=nonembed
+Using broad_delta_max_move_ratio=0.0
+Using broad_delta_schedule=500:1000:-0.005;2000:2400:-0.005
+Using final_readout_anchor_step=2400
+Using final_readout_apply_step=2830
+Using final_readout_alpha=0.14
+Using final_readout_scope=nonembed
+Using final_readout_max_move_ratio=0.0
+Using final_readout_linesearch_alphas=
+Using final_readout_linesearch_microbatches=4
+Using final_readout_sweep_alphas=
+Using curve_readout_window=0
+Using curve_readout_start_step=0
+Using curve_readout_apply_step=2830
+Using curve_readout_degree=1
+Using curve_readout_predict_ahead=1.0
+Using curve_readout_mode=point
+Using curve_readout_scope=nonembed
+Using curve_readout_max_move_ratio=0.0
+Using curve_readout_blend=1.0
+Using curve_readout_collect_before_trail_delta=False
+Using curve_readout_linesearch_blends=
+Using curve_readout_linesearch_microbatches=4
+Using curve_readout_sweep_aheads=
+Using curve_readout_sweep_blends=
+Using curve_readout_sweep_modes=
+Using checkpoint_dir=/tmp/trajectory_readout_v3/checkpoints
+Using checkpoint_prefix=pr311_seed11
+Using save_checkpoint_steps=[]
+Using load_checkpoint=
+Using align_dataloader_on_load=False
+Using exit_after_save_checkpoint=False
+Using exit_after_save_checkpoint_step=0
+Using macro_cem_mode=False
+Using macro_cem_group_mode=False
+Using macro_ref_t0=
+Using macro_ref_t1=
+Using macro_ref_t2=
+Using model_layers=12
+Using model_dim=768
+Using vocab_size=50304
+Using val_tokens=10485760
+Using batch_tokens=524288
+Using micro_batch_seqs=64
+Using val_regular_interval=999999
+Dampened radial gradient component is applied before the u/w floor; post-step radius is corrected to remove tangent drift.
+Circuit-Muon couples each attn.v <-> attn.proj pair: per-head partner-scalar post-whitening (norm-preserving) + trace-only gauge rebalance.
+====================================================================================================
+broad_delta[0] captured step:500 apply_step:1000 gamma:-0.005 tensors:172
+broad_delta[0] step:1000 gamma:-0.005 delta_norm:1454.601074 moved_norm:7.273006 clipped:0
+broad_delta[0]_groups adam:count=100 delta_norm=373.833466 moved_norm=1.869167 max_move_rel=0.00542126 max_tensor=blocks.0.norm1.gains | ov:count=24 delta_norm=666.771851 moved_norm=3.333859 max_move_rel=0.00426171 max_tensor=blocks.0.attn.v.weight | muon_other:count=48 delta_norm=1237.549316 moved_norm=6.187747 max_move_rel=0.00452311 max_tensor=blocks.4.attn.q.weight
+broad_delta[1] captured step:2000 apply_step:2400 gamma:-0.005 tensors:172
+broad_delta[1] step:2400 gamma:-0.005 delta_norm:922.913330 moved_norm:4.614567 clipped:0
+broad_delta[1]_groups adam:count=100 delta_norm=146.756149 moved_norm=0.733781 max_move_rel=0.000755595 max_tensor=proj.weight | ov:count=24 delta_norm=434.147156 moved_norm=2.170736 max_move_rel=0.00132517 max_tensor=blocks.10.attn.proj.weight | muon_other:count=48 delta_norm=801.091736 moved_norm=4.005459 max_move_rel=0.00156682 max_tensor=blocks.11.attn.q.weight
+final_readout captured step:2400 tensors:172
+trail_delta captured step:2630
+trail_delta step:2730 gamma:-0.04 delta_norm:216.696503 moved_norm:8.667860 clipped:0 adam_damped:0 muon_damped:0 lookahead_touched:0
+trail_delta_groups adam:count=100 delta_norm=35.280346 moved_norm=1.411214 max_move_rel=0.00164279 max_tensor=blocks.1.norm2.gains | ov:count=24 delta_norm=106.368057 moved_norm=4.254723 max_move_rel=0.00255172 max_tensor=blocks.11.attn.proj.weight | muon_other:count=48 delta_norm=185.468353 moved_norm=7.418734 max_move_rel=0.00268308 max_tensor=blocks.11.attn.q.weight
+trail_delta step:2830 gamma:-0.12 delta_norm:202.230789 moved_norm:24.267702 clipped:0 adam_damped:0 muon_damped:0 lookahead_touched:0
+trail_delta_groups adam:count=100 delta_norm=37.788021 moved_norm=4.534563 max_move_rel=0.00460151 max_tensor=proj.weight | ov:count=24 delta_norm=98.211952 moved_norm=11.785434 max_move_rel=0.00707118 max_tensor=blocks.11.attn.proj.weight | muon_other:count=48 delta_norm=172.695618 moved_norm=20.723473 max_move_rel=0.00761122 max_tensor=blocks.11.attn.q.weight
+final_readout applied step:2830 anchor_step:2400 alpha:0.14 delta_norm:536.932617 moved_norm:75.170578 clipped:0
+step:2830/2830 val_loss:3.28013 train_time:4805.966s step_avg:1698.22ms
