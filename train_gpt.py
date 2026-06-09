@@ -56,18 +56,18 @@ dist.init_process_group(backend="cuda:nccl,cpu:gloo", device_id=device)
 dist.barrier()
 master_process = (rank == 0) # this process will do logging, checkpointing etc.
 
-# Optional H5a-style history for NorMuon pre-polar directions. Defaults are off
-# so the PR #321 baseline path stays bit-for-bit structurally unchanged unless
-# MUON_HISTORY_STEPS is set.
-MUON_HISTORY_STEPS = int(os.environ.get("MUON_HISTORY_STEPS", "0"))
+# H5a-style history for NorMuon pre-polar directions. Defaults match the
+# previous 2830-step delta-cosine-shrink recipe; set MUON_HISTORY_STEPS=0 to
+# recover the PR #321 baseline path.
+MUON_HISTORY_STEPS = int(os.environ.get("MUON_HISTORY_STEPS", "4"))
 MUON_HISTORY_BLEND = float(os.environ.get("MUON_HISTORY_BLEND", "0.25"))
-MUON_HISTORY_BLEND_LATE = float(os.environ.get("MUON_HISTORY_BLEND_LATE", str(MUON_HISTORY_BLEND)))
-MUON_HISTORY_BLEND_SWITCH_STEP = int(os.environ.get("MUON_HISTORY_BLEND_SWITCH_STEP", "0"))
+MUON_HISTORY_BLEND_LATE = float(os.environ.get("MUON_HISTORY_BLEND_LATE", "0.15"))
+MUON_HISTORY_BLEND_SWITCH_STEP = int(os.environ.get("MUON_HISTORY_BLEND_SWITCH_STEP", "2300"))
 MUON_HISTORY_LOOKAHEAD = float(os.environ.get("MUON_HISTORY_LOOKAHEAD", "1.0"))
 MUON_HISTORY_MIN_COS = float(os.environ.get("MUON_HISTORY_MIN_COS", "0.25"))
 MUON_HISTORY_MAX_DELTA = float(os.environ.get("MUON_HISTORY_MAX_DELTA", "0.25"))
-MUON_HISTORY_DECAY_START_STEP = int(os.environ.get("MUON_HISTORY_DECAY_START_STEP", "-1"))
-MUON_HISTORY_DECAY_END_STEP = int(os.environ.get("MUON_HISTORY_DECAY_END_STEP", "-1"))
+MUON_HISTORY_DECAY_START_STEP = int(os.environ.get("MUON_HISTORY_DECAY_START_STEP", "2300"))
+MUON_HISTORY_DECAY_END_STEP = int(os.environ.get("MUON_HISTORY_DECAY_END_STEP", "2750"))
 MUON_HISTORY_FINAL_BLEND_MULT = float(os.environ.get("MUON_HISTORY_FINAL_BLEND_MULT", "0.0"))
 MUON_HISTORY_DELTA_COS_SHRINK = bool(int(os.environ.get("MUON_HISTORY_DELTA_COS_SHRINK", "1")))
 MUON_HISTORY_DELTA_COS_MIN_SCALE = float(os.environ.get("MUON_HISTORY_DELTA_COS_MIN_SCALE", "0.0"))
