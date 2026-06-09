@@ -56,6 +56,23 @@ dist.init_process_group(backend="cuda:nccl,cpu:gloo", device_id=device)
 dist.barrier()
 master_process = (rank == 0) # this process will do logging, checkpointing etc.
 
+# Optional H5a-style history for NorMuon pre-polar directions. Defaults are off
+# so the PR #321 baseline path stays bit-for-bit structurally unchanged unless
+# MUON_HISTORY_STEPS is set.
+MUON_HISTORY_STEPS = int(os.environ.get("MUON_HISTORY_STEPS", "0"))
+MUON_HISTORY_BLEND = float(os.environ.get("MUON_HISTORY_BLEND", "0.25"))
+MUON_HISTORY_BLEND_LATE = float(os.environ.get("MUON_HISTORY_BLEND_LATE", str(MUON_HISTORY_BLEND)))
+MUON_HISTORY_BLEND_SWITCH_STEP = int(os.environ.get("MUON_HISTORY_BLEND_SWITCH_STEP", "0"))
+MUON_HISTORY_LOOKAHEAD = float(os.environ.get("MUON_HISTORY_LOOKAHEAD", "1.0"))
+MUON_HISTORY_MIN_COS = float(os.environ.get("MUON_HISTORY_MIN_COS", "0.25"))
+MUON_HISTORY_MAX_DELTA = float(os.environ.get("MUON_HISTORY_MAX_DELTA", "0.25"))
+MUON_HISTORY_DECAY_START_STEP = int(os.environ.get("MUON_HISTORY_DECAY_START_STEP", "-1"))
+MUON_HISTORY_DECAY_END_STEP = int(os.environ.get("MUON_HISTORY_DECAY_END_STEP", "-1"))
+MUON_HISTORY_FINAL_BLEND_MULT = float(os.environ.get("MUON_HISTORY_FINAL_BLEND_MULT", "0.0"))
+MUON_HISTORY_DELTA_COS_SHRINK = bool(int(os.environ.get("MUON_HISTORY_DELTA_COS_SHRINK", "1")))
+MUON_HISTORY_DELTA_COS_MIN_SCALE = float(os.environ.get("MUON_HISTORY_DELTA_COS_MIN_SCALE", "0.0"))
+MUON_HISTORY_LABELS = {part.strip() for part in os.environ.get("MUON_HISTORY_LABELS", "all").split(",") if part.strip()}
+
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
 # Transposed layout by @ChrisJMcCormick allows for faster gradient accumulation.
@@ -247,6 +264,58 @@ def polar_express(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, momen
 
     return X
 
+@torch.compile(dynamic=False, fullgraph=True)
+def polar_express_from_update(g: torch.Tensor, split_baddbmm: bool = False):
+    """Polar Express Sign Method for an already-built pre-polar update."""
+    X = g.bfloat16()
+    is_tall = g.size(-2) > g.size(-1)
+
+    # Ensure spectral norm is at most 1
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) * (1 + 2e-2) + 1e-6)
+
+    X = X.contiguous()
+
+    if is_tall:
+        A = torch.empty((*X.shape[:-2], X.size(-1), X.size(-1)), device=X.device, dtype=X.dtype)
+        B = torch.empty_like(A)
+        C = torch.empty_like(X)
+
+        if split_baddbmm:
+            XB_matmul = torch.bmm if X.ndim > 2 else torch.mm
+        else:
+            aX_plus_XB = torch.baddbmm if X.ndim > 2 else torch.addmm
+
+        for a, b, c in polar_express_coeffs:
+            XTX(X, out=A)
+            ba_plus_cAA(A, alpha=c, beta=b, out=B)
+            if split_baddbmm:
+                XB_matmul(X, B, out=C)
+                C.add_(X, alpha=a)
+            else:
+                aX_plus_XB(X, X, B, beta=a, out=C)
+            X, C = C, X
+    else:
+        A = torch.empty((*X.shape[:-1], X.size(-2)), device=X.device, dtype=X.dtype)
+        B = torch.empty_like(A)
+        C = torch.empty_like(X)
+
+        if split_baddbmm:
+            BX_matmul = torch.bmm if X.ndim > 2 else torch.mm
+        else:
+            aX_plus_BX = torch.baddbmm if X.ndim > 2 else torch.addmm
+
+        for a, b, c in polar_express_coeffs:
+            XXT(X, out=A)
+            ba_plus_cAA(A, alpha=c, beta=b, out=B)
+            if split_baddbmm:
+                BX_matmul(B, X, out=C)
+                C.add_(X, alpha=a)
+            else:
+                aX_plus_BX(X, B, X, beta=a, out=C)
+            X, C = C, X
+
+    return X
+
 # -----------------------------------------------------------------------------
 # Sparse Comms for bigram embedding gradient reduce-scatter
 def _sparse_comms_active():
@@ -341,6 +410,81 @@ def sparse_comms_merge_gradients(grad, recv_idx, recv_vals, rank, world):
 
 # -----------------------------------------------------------------------------
 # Combined NorMuon + Adam Optimizer
+
+def _muon_history_enabled_for_label(label: str) -> bool:
+    return (
+        MUON_HISTORY_STEPS > 0
+        and (not MUON_HISTORY_LABELS or "all" in MUON_HISTORY_LABELS or label in MUON_HISTORY_LABELS)
+    )
+
+def _scheduled_muon_history_blend(step: int) -> float:
+    blend = MUON_HISTORY_BLEND_LATE if (
+        MUON_HISTORY_BLEND_SWITCH_STEP > 0 and step >= MUON_HISTORY_BLEND_SWITCH_STEP
+    ) else MUON_HISTORY_BLEND
+    if MUON_HISTORY_DECAY_START_STEP >= 0 and MUON_HISTORY_DECAY_END_STEP > MUON_HISTORY_DECAY_START_STEP:
+        if step >= MUON_HISTORY_DECAY_START_STEP:
+            progress = min(1.0, max(0.0, (step - MUON_HISTORY_DECAY_START_STEP) / (
+                MUON_HISTORY_DECAY_END_STEP - MUON_HISTORY_DECAY_START_STEP
+            )))
+            blend *= (1.0 - progress) + progress * MUON_HISTORY_FINAL_BLEND_MULT
+    return blend
+
+def apply_muon_history(update: Tensor, state: dict, step: int) -> Tensor:
+    """H5a pre-polar history mix for batched NorMuon update matrices."""
+    history_steps = MUON_HISTORY_STEPS
+    if history_steps <= 0:
+        return update
+
+    if "muon_history_buffer" not in state or state["muon_history_buffer"].size(0) != history_steps:
+        state["muon_history_buffer"] = torch.zeros(
+            (history_steps, *update.shape), dtype=update.dtype, device=update.device
+        )
+        state["muon_history_filled"] = 0
+
+    history = state["muon_history_buffer"]
+    filled = int(state.get("muon_history_filled", 0))
+    current = update
+    out = current
+
+    history_blend = _scheduled_muon_history_blend(step)
+    if filled >= history_steps and history_blend > 0.0:
+        cur_norm = current.float().norm(dim=(-2, -1), keepdim=True).clamp_min(1e-10)
+        num_points = history_steps + 1
+        x_mean = history_steps / 2.0
+        x_pred = history_steps + MUON_HISTORY_LOOKAHEAD
+        denom = sum((i - x_mean) ** 2 for i in range(num_points))
+
+        current_weight = 1.0 / num_points + (x_pred - x_mean) * (history_steps - x_mean) / denom
+        pred = current * current_weight
+        for i in range(history_steps):
+            weight = 1.0 / num_points + (x_pred - x_mean) * (i - x_mean) / denom
+            pred = pred + history[i].to(current.dtype) * weight
+
+        delta = pred - current
+        delta_norm = delta.float().norm(dim=(-2, -1), keepdim=True).clamp_min(1e-10)
+        delta_cos = (delta.float() * current.float()).sum(dim=(-2, -1), keepdim=True) / (delta_norm * cur_norm)
+        max_delta = MUON_HISTORY_MAX_DELTA * cur_norm
+        delta = delta * torch.minimum(torch.ones_like(delta_norm), max_delta / delta_norm).to(delta.dtype)
+
+        if MUON_HISTORY_DELTA_COS_SHRINK:
+            delta_scale = torch.clamp(
+                (1.0 + delta_cos) * 0.5,
+                min=MUON_HISTORY_DELTA_COS_MIN_SCALE,
+                max=1.0,
+            ).to(delta.dtype)
+            delta = delta * delta_scale
+
+        candidate = current + history_blend * delta
+        cand_norm = candidate.float().norm(dim=(-2, -1), keepdim=True).clamp_min(1e-10)
+        cos = (candidate.float() * current.float()).sum(dim=(-2, -1), keepdim=True) / (cand_norm * cur_norm)
+        out = torch.where(cos >= MUON_HISTORY_MIN_COS, candidate, current)
+        out = out * (cur_norm / out.float().norm(dim=(-2, -1), keepdim=True).clamp_min(1e-10)).to(out.dtype)
+
+    if history_steps > 1:
+        history[:-1].copy_(history[1:].clone())
+    history[history_steps - 1].copy_(current)
+    state["muon_history_filled"] = min(history_steps, filled + 1)
+    return out
 
 @dataclass(slots=True)
 class ParamConfig:
@@ -454,6 +598,7 @@ class NorMuonAndAdam:
         self._eff_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._eff_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._momentum_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self.step_count = 0
 
         # Track async operations
         self._reduce_futures: dict[nn.Parameter, tuple] = {}
@@ -640,12 +785,16 @@ class NorMuonAndAdam:
     def reset(self):
         """Reset NorMuon momentum buffers and split_embed state (called on training reset)."""
         self.split_embed = False
+        self.step_count = 0
         for param, p_cfg in self.param_cfgs.items():
             if p_cfg.optim == "normuon":
                 p_state = self.param_states[param]
                 p_state["momentum_buffer"].zero_()
                 p_state["mantissa"].zero_()
                 p_state["second_momentum_buffer"].zero_()
+                if "muon_history_buffer" in p_state:
+                    p_state["muon_history_buffer"].zero_()
+                p_state["muon_history_filled"] = 0
 
     def copy_lm_state_to_embed(self):
         """
@@ -814,6 +963,7 @@ class NorMuonAndAdam:
             if p_cfg.optim == "adam" and not do_adam:
                 continue  # Don't clear Adam grads on even steps
             param.grad = None
+        self.step_count += 1
 
     # -----------------------------------
     # Adam update
@@ -870,12 +1020,21 @@ class NorMuonAndAdam:
         self._eff_lr_t.fill_(p_cfg.lr_mul * p_cfg.lr)
         self._eff_wd_t.fill_(p_cfg.wd_mul * p_cfg.weight_decay * p_cfg.lr)
 
-        # Fused Nesterov momentum + Polar Express orthogonalization
+        # Fused Nesterov momentum + Polar Express orthogonalization.
+        # When enabled, H5a inserts a small, capped history correction before
+        # the polar projection; otherwise keep the PR321 fused baseline path.
         is_large_matrix = chunk_shape[-2] > 1024
-        v_chunk = polar_express(
-            grad_chunk, p_state["momentum_buffer"], self._momentum_t,
-            split_baddbmm=is_large_matrix,
-        )
+        if _muon_history_enabled_for_label(p_cfg.label):
+            momentum = p_cfg.momentum
+            p_state["momentum_buffer"].lerp_(grad_chunk, 1 - momentum)
+            prepolar_chunk = grad_chunk.lerp(p_state["momentum_buffer"], momentum)
+            prepolar_chunk = apply_muon_history(prepolar_chunk, p_state, self.step_count)
+            v_chunk = polar_express_from_update(prepolar_chunk, split_baddbmm=is_large_matrix)
+        else:
+            v_chunk = polar_express(
+                grad_chunk, p_state["momentum_buffer"], self._momentum_t,
+                split_baddbmm=is_large_matrix,
+            )
 
         # Variance reduction
         red_dim = -1 if chunk_shape[-2] >= chunk_shape[-1] else -2
@@ -2006,6 +2165,19 @@ print0("="*100)
 print0(f"Running Python {sys.version}")
 print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
 print0(f"Running Triton version {triton.__version__}")
+print0(f"MUON_HISTORY_STEPS={MUON_HISTORY_STEPS}")
+print0(f"MUON_HISTORY_BLEND={MUON_HISTORY_BLEND}")
+print0(f"MUON_HISTORY_BLEND_LATE={MUON_HISTORY_BLEND_LATE}")
+print0(f"MUON_HISTORY_BLEND_SWITCH_STEP={MUON_HISTORY_BLEND_SWITCH_STEP}")
+print0(f"MUON_HISTORY_LOOKAHEAD={MUON_HISTORY_LOOKAHEAD}")
+print0(f"MUON_HISTORY_MIN_COS={MUON_HISTORY_MIN_COS}")
+print0(f"MUON_HISTORY_MAX_DELTA={MUON_HISTORY_MAX_DELTA}")
+print0(f"MUON_HISTORY_DECAY_START_STEP={MUON_HISTORY_DECAY_START_STEP}")
+print0(f"MUON_HISTORY_DECAY_END_STEP={MUON_HISTORY_DECAY_END_STEP}")
+print0(f"MUON_HISTORY_FINAL_BLEND_MULT={MUON_HISTORY_FINAL_BLEND_MULT}")
+print0(f"MUON_HISTORY_DELTA_COS_SHRINK={int(MUON_HISTORY_DELTA_COS_SHRINK)}")
+print0(f"MUON_HISTORY_DELTA_COS_MIN_SCALE={MUON_HISTORY_DELTA_COS_MIN_SCALE}")
+print0(f"MUON_HISTORY_LABELS={','.join(sorted(MUON_HISTORY_LABELS))}")
 
 def nvidia_smi():
     import subprocess  # avoid top level import
