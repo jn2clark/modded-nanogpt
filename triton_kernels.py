@@ -931,7 +931,24 @@ ce_fwd_bwd_kernel = torch.cuda._compile_kernel(
     cuda_include_dirs=["/usr/local/cuda/include/"],
     nvcc_options=["-lineinfo", "--use_fast_math"],
 )
-ce_fwd_bwd_kernel.set_shared_memory_config(CE_KERNEL_VOCAB_SIZE * 2)
+if hasattr(ce_fwd_bwd_kernel, "set_shared_memory_config"):
+    ce_fwd_bwd_kernel.set_shared_memory_config(CE_KERNEL_VOCAB_SIZE * 2)
+else:
+    import ctypes
+    import ctypes.util
+
+    _libcuda = ctypes.CDLL(ctypes.util.find_library("cuda") or "libcuda.so")
+    _cu_func_set_attribute = _libcuda.cuFuncSetAttribute
+    _cu_func_set_attribute.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+    _cu_func_set_attribute.restype = ctypes.c_int
+    _CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8
+    _err = _cu_func_set_attribute(
+        ce_fwd_bwd_kernel.func,
+        _CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+        CE_KERNEL_VOCAB_SIZE * 2,
+    )
+    if _err != 0:
+        raise RuntimeError(f"cuFuncSetAttribute failed for ce_fwd_bwd_kernel: {_err}")
 
 @torch.library.custom_op("nanogpt::ce_fwd_bwd", mutates_args={"losses", "grad_input"})
 def ce_fwd_bwd(

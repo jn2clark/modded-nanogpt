@@ -14,6 +14,7 @@ with open(os.path.join(os.path.dirname(sys.argv[0]), 'dc_triton_kernels.py'), 'r
 import copy
 import glob
 import math
+import random
 import threading
 import time
 import uuid
@@ -45,6 +46,25 @@ from dc_triton_kernels import (
 # Fused triton kernel: relu(x @ W1.T)^2 @ W2.T
 # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
 ReLUSqrdMLP = FusedLinearReLUSquareFunction.apply
+
+def env_flag(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).lower() not in ("", "0", "false", "no")
+
+DISABLE_FUSED_CE = env_flag("DISABLE_FUSED_CE")
+
+MUON_HISTORY_STEPS = int(os.environ.get("MUON_HISTORY_STEPS", "0"))
+MUON_HISTORY_SCOPE = os.environ.get("MUON_HISTORY_SCOPE", "mlp")
+MUON_HISTORY_START = int(os.environ.get("MUON_HISTORY_START", "0"))
+MUON_HISTORY_END = int(os.environ.get("MUON_HISTORY_END", "1000000000"))
+MUON_HISTORY_BLEND = float(os.environ.get("MUON_HISTORY_BLEND", "0.25"))
+MUON_HISTORY_LOOKAHEAD = float(os.environ.get("MUON_HISTORY_LOOKAHEAD", "1.0"))
+MUON_HISTORY_MAX_DELTA = float(os.environ.get("MUON_HISTORY_MAX_DELTA", "0.25"))
+MUON_HISTORY_COHERENCE = env_flag("MUON_HISTORY_COHERENCE", "1")
+MUON_HISTORY_POST_CAP = float(os.environ.get("MUON_HISTORY_POST_CAP", "0.0"))
+MUON_HISTORY_SKILL_BETA = float(os.environ.get("MUON_HISTORY_SKILL_BETA", "0.98"))
+MUON_HISTORY_SKILL_LOW = float(os.environ.get("MUON_HISTORY_SKILL_LOW", "0.0"))
+MUON_HISTORY_SKILL_HIGH = float(os.environ.get("MUON_HISTORY_SKILL_HIGH", "0.10"))
+MUON_HISTORY_RETRACT = env_flag("MUON_HISTORY_RETRACT", "0")
 
 dynamo.config.recompile_limit = 64
 
@@ -253,6 +273,52 @@ def polar_express(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, momen
 
     return X
 
+@torch.compile(dynamic=False, fullgraph=True)
+def normuon_pre_polar(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, momentum_t: torch.Tensor):
+    momentum = momentum_t.to(grad_chunk.dtype)
+    momentum_buffer.lerp_(grad_chunk, 1 - momentum)
+    return grad_chunk.lerp_(momentum_buffer, momentum)
+
+@torch.compile(dynamic=False, fullgraph=True)
+def polar_express_no_momentum(g: torch.Tensor, split_baddbmm: bool = False):
+    X = g.bfloat16()
+    is_tall = g.size(-2) > g.size(-1)
+
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) * (1 + 2e-2) + 1e-6)
+    X = X.contiguous()
+
+    if is_tall:
+        A = torch.empty((*X.shape[:-2], X.size(-1), X.size(-1)), device=X.device, dtype=X.dtype)
+        B = torch.empty_like(A)
+        C = torch.empty_like(X)
+
+        if split_baddbmm:
+            XB_matmul = torch.bmm if X.ndim > 2 else torch.mm
+        else:
+            aX_plus_XB = torch.baddbmm if X.ndim > 2 else torch.addmm
+
+        for a, b, c in polar_express_coeffs:
+            XTX(X, out=A)
+            ba_plus_cAA(A, alpha=c, beta=b, out=B)
+            if split_baddbmm:
+                XB_matmul(X, B, out=C)
+                C.add_(X, alpha=a)
+            else:
+                aX_plus_XB(X, X, B, beta=a, out=C)
+            X, C = C, X
+    else:
+        A = torch.empty((*X.shape[:-2], X.size(-2), X.size(-2)), device=X.device, dtype=X.dtype)
+        B = torch.empty_like(A)
+        C = torch.empty_like(X)
+        for a, b, c in polar_express_coeffs:
+            XXT(X, out=A)
+            ba_plus_cAA(A, alpha=c, beta=b, out=B)
+            torch.bmm(B, X, out=C)
+            C.add_(X, alpha=a)
+            X, C = C, X
+
+    return X
+
 # -----------------------------------------------------------------------------
 # Sparse Comms for bigram embedding gradient reduce-scatter
 def _sparse_comms_active():
@@ -357,6 +423,7 @@ class ParamConfig:
     adam_betas: tuple[float, float] | None
     lr_mul: float
     wd_mul: float
+    adam_coptim: float
     lr: float
     initial_lr: float
     weight_decay: float
@@ -460,6 +527,8 @@ class NorMuonAndAdam:
         self._eff_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._eff_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._momentum_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._noise_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._normuon_noise_scale = 0.0
 
         # Track async operations
         self._reduce_futures: dict[nn.Parameter, tuple] = {}
@@ -480,6 +549,7 @@ class NorMuonAndAdam:
         adam_betas = table_entry.get("adam_betas")
         lr_mul = table_entry.get("lr_mul", 1.0)
         wd_mul = table_entry.get("wd_mul", 1.0)
+        adam_coptim = table_entry.get("adam_coptim", 0.0)
 
         if optim == "adam":
             chunk_size = param.shape[0] // self.world_size if comms.startswith("sharded") else None
@@ -490,6 +560,7 @@ class NorMuonAndAdam:
                 adam_betas=tuple(adam_betas) if adam_betas else None,
                 lr_mul=lr_mul,
                 wd_mul=wd_mul,
+                adam_coptim=adam_coptim,
                 lr=self.adam_defaults["lr"],
                 initial_lr=self.adam_defaults["lr"],
                 weight_decay=self.adam_defaults["weight_decay"],
@@ -527,6 +598,7 @@ class NorMuonAndAdam:
                 adam_betas=tuple(adam_betas) if adam_betas else None,
                 lr_mul=lr_mul,
                 wd_mul=wd_mul,
+                adam_coptim=0.0,
                 lr=self.normuon_defaults["lr"],
                 initial_lr=self.normuon_defaults["lr"],
                 weight_decay=self.normuon_defaults["weight_decay"],
@@ -576,9 +648,14 @@ class NorMuonAndAdam:
                 )
 
                 self.param_states[param] = dict(
+                    step=0,
                     momentum_buffer=momentum_buffer,
                     second_momentum_buffer=second_momentum_buffer,
                     mantissa=mantissa,
+                    muon_history=[],
+                    muon_prev_u_parent=None,
+                    muon_prev_u_forecast=None,
+                    muon_skill_ema=None,
                 )
 
     # -----------------------------------
@@ -649,9 +726,14 @@ class NorMuonAndAdam:
         for param, p_cfg in self.param_cfgs.items():
             if p_cfg.optim == "normuon":
                 p_state = self.param_states[param]
+                p_state["step"] = 0
                 p_state["momentum_buffer"].zero_()
                 p_state["mantissa"].zero_()
                 p_state["second_momentum_buffer"].zero_()
+                p_state["muon_history"] = []
+                p_state["muon_prev_u_parent"] = None
+                p_state["muon_prev_u_forecast"] = None
+                p_state["muon_skill_ema"] = None
 
     def copy_lm_state_to_embed(self):
         """
@@ -843,10 +925,16 @@ class NorMuonAndAdam:
         self._step_size_t.fill_(lr * (bias2 ** 0.5 / bias1))
         self._eff_wd_t.fill_(lr * lr * p_cfg.weight_decay * p_cfg.wd_mul)
 
-        NorMuonAndAdam._adam_update_step(
-            p_slice, grad_chunk, p_state["exp_avg"], p_state["exp_avg_sq"],
-            beta1, beta2, p_cfg.eps, self._step_size_t, self._eff_wd_t
-        )
+        if p_cfg.adam_coptim > 0.0:
+            NorMuonAndAdam._adam_update_step_coptim(
+                p_slice, grad_chunk, p_state["exp_avg"], p_state["exp_avg_sq"],
+                beta1, beta2, p_cfg.eps, self._step_size_t, self._eff_wd_t, p_cfg.adam_coptim
+            )
+        else:
+            NorMuonAndAdam._adam_update_step(
+                p_slice, grad_chunk, p_state["exp_avg"], p_state["exp_avg_sq"],
+                beta1, beta2, p_cfg.eps, self._step_size_t, self._eff_wd_t
+            )
 
         return p_slice
 
@@ -862,14 +950,197 @@ class NorMuonAndAdam:
         update.addcmul_(p_slice, mask, value=eff_wd_t)
         p_slice.add_(other=update, alpha=-1.0)
 
+    @staticmethod
+    @torch.compile(dynamic=False, fullgraph=True)
+    def _adam_update_step_coptim(p_slice, g_slice, exp_avg, exp_avg_sq, beta1, beta2, eps, step_size_t, eff_wd_t, strength: float):
+        """Adam update with C-Optim sign-agreement masking on the adaptive step."""
+        exp_avg.mul_(beta1).add_(g_slice, alpha=1 - beta1)
+        exp_avg_sq.mul_(beta2).addcmul_(g_slice, g_slice, value=1 - beta2)
+        update = exp_avg.div(exp_avg_sq.sqrt().add_(eps)).mul_(step_size_t)
+
+        agree = (update * g_slice) > 0
+        keep = agree.to(update.dtype)
+        keep_mean = keep.float().mean().clamp_min_(1e-3).to(update.dtype)
+        masked_update = update * (keep / keep_mean)
+        update.lerp_(masked_update, strength)
+
+        mask = (update * p_slice) > 0
+        update.addcmul_(p_slice, mask, value=eff_wd_t)
+        p_slice.add_(other=update, alpha=-1.0)
+
     # -----------------------------------
     # NorMuon update
+
+    def _muon_history_enabled(self, p_cfg: ParamConfig) -> bool:
+        if MUON_HISTORY_STEPS <= 0 or MUON_HISTORY_BLEND == 0.0:
+            return False
+        scopes = {scope.strip() for scope in MUON_HISTORY_SCOPE.split(",") if scope.strip()}
+        return (
+            "all" in scopes
+            or p_cfg.label in scopes
+            or (p_cfg.label == "mlp_bank" and "mlp" in scopes)
+            or (p_cfg.label == "mlp_bank" and "mlp_fc" in scopes)
+            or (p_cfg.label == "mlp_bank" and "mlp_proj" in scopes)
+            or (p_cfg.label == "qk_bank" and "qk" in scopes)
+            or (p_cfg.label == "vo_bank" and ("ov" in scopes or "vo" in scopes))
+        )
+
+    def _muon_history_mask(self, pre_polar: Tensor, p_cfg: ParamConfig, rank: int) -> Tensor | None:
+        if p_cfg.label != "mlp_bank":
+            return None
+        scopes = {scope.strip() for scope in MUON_HISTORY_SCOPE.split(",") if scope.strip()}
+        if "mlp" in scopes or "all" in scopes:
+            return None
+        wants_fc = "mlp_fc" in scopes
+        wants_proj = "mlp_proj" in scopes
+        if not wants_fc and not wants_proj:
+            return None
+        global_idx = rank * p_cfg.chunk_size + torch.arange(p_cfg.chunk_size, device=pre_polar.device)
+        is_proj = (global_idx % 2) == 1
+        selected = torch.zeros_like(is_proj, dtype=torch.bool)
+        if wants_fc:
+            selected = selected | ~is_proj
+        if wants_proj:
+            selected = selected | is_proj
+        return selected.view(-1, 1, 1)
+
+    def _apply_muon_history(self, pre_polar: Tensor, p_state: dict, p_cfg: ParamConfig, rank: int) -> Tensor:
+        if not self._muon_history_enabled(p_cfg):
+            return pre_polar
+
+        eps = 1e-12
+        step = p_state["step"]
+        pre_norm = pre_polar.float().norm(dim=(-2, -1), keepdim=True).clamp_min(eps)
+        unit = pre_polar.float() / pre_norm
+        history = p_state["muon_history"]
+
+        out = pre_polar
+        active = MUON_HISTORY_START <= step <= MUON_HISTORY_END and len(history) >= MUON_HISTORY_STEPS
+        if active:
+            hist = history[-MUON_HISTORY_STEPS:]
+            hist0 = hist[0].float()
+            velocity = (unit - hist0) / float(MUON_HISTORY_STEPS)
+            pred_unit = unit + MUON_HISTORY_LOOKAHEAD * velocity
+            pred_unit = pred_unit / pred_unit.norm(dim=(-2, -1), keepdim=True).clamp_min(eps)
+            pred = pred_unit * pre_norm
+            delta = pred - pre_polar
+            delta_norm = delta.float().norm(dim=(-2, -1), keepdim=True).clamp_min(eps)
+            cap = (MUON_HISTORY_MAX_DELTA * pre_norm / delta_norm).clamp(max=1.0)
+
+            if MUON_HISTORY_COHERENCE:
+                path_len = torch.zeros_like(pre_norm)
+                prev = hist[0].float()
+                for point in hist[1:]:
+                    cur = point.float()
+                    path_len = path_len + (cur - prev).norm(dim=(-2, -1), keepdim=True)
+                    prev = cur
+                path_len = path_len + (unit - prev).norm(dim=(-2, -1), keepdim=True)
+                coherence = (unit - hist0).norm(dim=(-2, -1), keepdim=True) / path_len.clamp_min(eps)
+            else:
+                coherence = 1.0
+
+            mix = pre_polar + delta * (MUON_HISTORY_BLEND * cap * coherence)
+            out = mix * (pre_norm / mix.float().norm(dim=(-2, -1), keepdim=True).clamp_min(eps))
+            selected = self._muon_history_mask(pre_polar, p_cfg, rank)
+            if selected is not None:
+                out = torch.where(selected, out, pre_polar)
+
+        history.append(unit.detach().to(torch.bfloat16).clone())
+        if len(history) > MUON_HISTORY_STEPS:
+            del history[:len(history) - MUON_HISTORY_STEPS]
+        return out
+
+    def _muon_history_post_polar_update(self, pre_polar: Tensor, p_state: dict, p_cfg: ParamConfig, rank: int,
+                                        split_baddbmm: bool) -> Tensor:
+        eps = 1e-12
+        step = p_state["step"]
+        pre_norm = pre_polar.float().norm(dim=(-2, -1), keepdim=True).clamp_min(eps)
+        unit = pre_polar.float() / pre_norm
+        history = p_state["muon_history"]
+
+        u_parent = polar_express_no_momentum(pre_polar, split_baddbmm=split_baddbmm)
+        u_parent_raw = u_parent
+
+        prev_parent = p_state.get("muon_prev_u_parent")
+        prev_forecast = p_state.get("muon_prev_u_forecast")
+        if prev_parent is not None and prev_forecast is not None:
+            parent_f = u_parent.float()
+            err_persist = (parent_f - prev_parent.float()).square().sum(dim=(-2, -1), keepdim=True)
+            err_pred = (parent_f - prev_forecast.float()).square().sum(dim=(-2, -1), keepdim=True)
+            skill = ((err_persist - err_pred) / err_persist.clamp_min(eps)).clamp(-1.0, 1.0)
+            old_skill = p_state.get("muon_skill_ema")
+            if old_skill is None:
+                skill_ema = skill.detach().clone()
+            else:
+                skill_ema = old_skill.float().mul(MUON_HISTORY_SKILL_BETA).add(
+                    skill.detach(), alpha=1.0 - MUON_HISTORY_SKILL_BETA
+                )
+            p_state["muon_skill_ema"] = skill_ema.detach().clone()
+        else:
+            skill_ema = p_state.get("muon_skill_ema")
+
+        u_forecast = None
+        active = MUON_HISTORY_START <= step <= MUON_HISTORY_END and len(history) >= MUON_HISTORY_STEPS
+        if len(history) >= MUON_HISTORY_STEPS:
+            hist = history[-MUON_HISTORY_STEPS:]
+            hist0 = hist[0].float()
+            velocity = (unit - hist0) / float(MUON_HISTORY_STEPS)
+            pred_unit = unit + MUON_HISTORY_LOOKAHEAD * velocity
+            pred_unit = pred_unit / pred_unit.norm(dim=(-2, -1), keepdim=True).clamp_min(eps)
+            pred = pred_unit * pre_norm
+
+            delta = pred - pre_polar
+            delta_norm = delta.float().norm(dim=(-2, -1), keepdim=True).clamp_min(eps)
+            cap = (MUON_HISTORY_MAX_DELTA * pre_norm / delta_norm).clamp(max=1.0)
+            candidate = pre_polar + delta * (MUON_HISTORY_BLEND * cap)
+            candidate = candidate * (pre_norm / candidate.float().norm(dim=(-2, -1), keepdim=True).clamp_min(eps))
+            u_forecast = polar_express_no_momentum(candidate, split_baddbmm=split_baddbmm)
+
+            if active and skill_ema is not None:
+                delta_u = u_forecast - u_parent
+                delta_u_norm = delta_u.float().norm(dim=(-2, -1), keepdim=True).clamp_min(eps)
+                parent_norm = u_parent.float().norm(dim=(-2, -1), keepdim=True).clamp_min(eps)
+                post_cap = (MUON_HISTORY_POST_CAP * parent_norm / delta_u_norm).clamp(max=1.0)
+
+                denom = max(MUON_HISTORY_SKILL_HIGH - MUON_HISTORY_SKILL_LOW, 1e-6)
+                gate = ((skill_ema.float() - MUON_HISTORY_SKILL_LOW) / denom).clamp(0.0, 1.0)
+
+                if MUON_HISTORY_COHERENCE:
+                    path_len = torch.zeros_like(pre_norm)
+                    prev = hist[0].float()
+                    for point in hist[1:]:
+                        cur = point.float()
+                        path_len = path_len + (cur - prev).norm(dim=(-2, -1), keepdim=True)
+                        prev = cur
+                    path_len = path_len + (unit - prev).norm(dim=(-2, -1), keepdim=True)
+                    coherence = (unit - hist0).norm(dim=(-2, -1), keepdim=True) / path_len.clamp_min(eps)
+                    gate = gate * coherence
+
+                selected = self._muon_history_mask(pre_polar, p_cfg, rank)
+                if selected is not None:
+                    gate = torch.where(selected, gate, torch.zeros_like(gate))
+
+                u_parent = u_parent + delta_u * (post_cap * gate).type_as(delta_u)
+                if MUON_HISTORY_RETRACT:
+                    u_parent = polar_express_no_momentum(u_parent, split_baddbmm=split_baddbmm)
+
+        history.append(unit.detach().to(torch.bfloat16).clone())
+        if len(history) > MUON_HISTORY_STEPS:
+            del history[:len(history) - MUON_HISTORY_STEPS]
+
+        p_state["muon_prev_u_parent"] = u_parent_raw.detach().to(torch.bfloat16).clone()
+        if u_forecast is None:
+            p_state["muon_prev_u_forecast"] = None
+        else:
+            p_state["muon_prev_u_forecast"] = u_forecast.detach().to(torch.bfloat16).clone()
+        return u_parent
 
     def _normuon_update(self, param: nn.Parameter, grad_chunk: Tensor, p_cfg: ParamConfig, rank: int) -> Tensor:
         """Apply NorMuon update to a parameter. Returns the updated p_slice."""
         chunk_shape = grad_chunk.shape
 
         p_state = self.param_states[param]
+        p_state["step"] += 1
         grad_chunk = grad_chunk.float()  # FP32 for momentum
 
         self._momentum_t.fill_(p_cfg.momentum)
@@ -878,16 +1149,30 @@ class NorMuonAndAdam:
 
         # Fused Nesterov momentum + Polar Express orthogonalization
         is_large_matrix = chunk_shape[-2] > 1024
-        v_chunk = polar_express(
-            grad_chunk, p_state["momentum_buffer"], self._momentum_t,
-            split_baddbmm=is_large_matrix,
-        )
+        if self._muon_history_enabled(p_cfg):
+            pre_polar = normuon_pre_polar(grad_chunk, p_state["momentum_buffer"], self._momentum_t)
+            if MUON_HISTORY_POST_CAP > 0.0:
+                v_chunk = self._muon_history_post_polar_update(
+                    pre_polar, p_state, p_cfg, rank, split_baddbmm=is_large_matrix
+                )
+            else:
+                pre_polar = self._apply_muon_history(pre_polar, p_state, p_cfg, rank)
+                v_chunk = polar_express_no_momentum(pre_polar, split_baddbmm=is_large_matrix)
+        else:
+            v_chunk = polar_express(
+                grad_chunk, p_state["momentum_buffer"], self._momentum_t,
+                split_baddbmm=is_large_matrix,
+            )
 
         # Variance reduction
         red_dim = -1 if chunk_shape[-2] >= chunk_shape[-1] else -2
         v_chunk = NorMuonAndAdam._apply_normuon_variance_reduction(
             v_chunk, p_state["second_momentum_buffer"], p_cfg.beta2, red_dim
         )
+
+        self._noise_t.fill_(self._normuon_noise_scale)
+        if self._normuon_noise_scale > 0.0:
+            v_chunk = NorMuonAndAdam._add_exploration_noise(v_chunk, self._noise_t, red_dim)
 
         # Update parameter, in place, with cautious weight decay
         param_view = param.data.view(p_cfg.reshape)
@@ -944,6 +1229,14 @@ class NorMuonAndAdam:
         v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt_()
         final_scale = step_size * (v_norm / v_norm_new.clamp_min_(1e-10))
         return v_chunk.mul_(final_scale.type_as(v_chunk))
+
+    @staticmethod
+    @torch.compile(dynamic=False, fullgraph=True)
+    def _add_exploration_noise(v_chunk, noise_t, red_dim):
+        sigma = noise_t.to(v_chunk.dtype)
+        row_rms = v_chunk.float().square().mean(dim=red_dim, keepdim=True).sqrt_().clamp_min_(1e-10)
+        noise = torch.randn_like(v_chunk) * (sigma * row_rms.type_as(v_chunk))
+        return v_chunk.add_(noise)
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
@@ -1066,12 +1359,7 @@ class AttnArgs:
     train_max_seq_len: torch.Tensor
 
 
-try:
-    _fa3_mod = get_kernel("kernels-community/flash-attn3", version=1)
-except BaseException as exc:
-    print(f"[rank{rank}] kernels-community/flash-attn3 load failed: {type(exc).__name__}: {exc}", flush=True)
-    _fa3_mod = get_kernel("varunneal/flash-attention-3", trust_remote_code=True)
-flash_attn_interface = getattr(_fa3_mod, "flash_attn_interface", _fa3_mod)
+flash_attn_interface = get_kernel("varunneal/flash-attention-3").flash_attn_interface
 
 
 def dc_gate(
@@ -1594,8 +1882,20 @@ class GPT(nn.Module):
         x = norm(x)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15
         # @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1). @classiclarryd updated to 23*sigmoid((logits+5)/7.5)
-        if self.training:
+        if self.training and not DISABLE_FUSED_CE:
             loss_per_token = FusedSoftcappedCrossEntropy.apply(x.view(-1, x.size(-1)), target_seq, mtp_weights, self.lm_head.weight, self.lm_head.x_s, self.lm_head.w_s, self.lm_head.grad_s, grad_scale)
+        elif self.training:
+            logits = self.lm_head(x).view(-1, self.vocab_size)
+            logits = 23 * torch.sigmoid((logits.float() + 5) / 7.5)
+            log_probs = F.log_softmax(logits, dim=-1)
+            n_rows = log_probs.size(0)
+            loss_per_token = torch.zeros(n_rows, dtype=torch.float32, device=log_probs.device)
+            for k in range(mtp_weights.numel()):
+                if k >= n_rows:
+                    break
+                shifted_targets = target_seq[k:n_rows].view(-1, 1)
+                shifted_loss = -log_probs[: n_rows - k].gather(1, shifted_targets).squeeze(1)
+                loss_per_token[: n_rows - k] = loss_per_token[: n_rows - k] + mtp_weights[k] * shifted_loss
         else:
             logits = self.lm_head(x)
             logits = 23 * torch.sigmoid((logits + 5) / 7.5)
@@ -1798,15 +2098,15 @@ class Hyperparameters:
     # batch sizes
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
-    num_scheduled_iterations: int = 1275  # number of steps to complete lr and ws schedule
-    num_extension_iterations: int = 15  # number of steps to continue training at final lr and ws
+    num_scheduled_iterations: int = int(os.environ.get("NUM_SCHEDULED_ITERATIONS", "1275"))  # number of steps to complete lr and ws schedule
+    num_extension_iterations: int = int(os.environ.get("NUM_EXTENSION_ITERATIONS", "15"))  # number of steps to continue training at final lr and ws
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
     # Descriptive run_id for this iteration:
     #   - explicit sparse connectivity refactor (no generic loop)
     #   - (1 + m_r9) * x self-reference fuse on layer 9
     #   - backout_lambda fully removed (slot dropped from self.scalars; absorbed into MUDD bias init)
-    val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
+    val_loss_every: int = int(os.environ.get("VAL_LOSS_EVERY", "250"))  # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint: bool = False
     run_evals: bool = False  # run additional evaluations after training is completed
     # bigram hash embedding
@@ -1839,10 +2139,12 @@ class TrainingSchedule:
     """
 
     def __init__(self, stages: list[TrainingStage], scheduled_iterations: int, extension_iterations: int,
-                 cooldown_frac: float = 0.5, split_embed_stage: int = 2, ws_post_yarn_ext: int = 20):
+                 cooldown_frac: float = 0.5, final_lr_mul: float = 0.15,
+                 split_embed_stage: int = 2, ws_post_yarn_ext: int = 20):
         self.stages = stages
         self.scheduled_iterations = scheduled_iterations
         self.cooldown_frac = cooldown_frac
+        self.final_lr_mul = final_lr_mul
         # increase final validation ws, used for YaRN extension and short window size @classiclarryd
         self.ws_post_yarn_ext = ws_post_yarn_ext
 
@@ -1878,7 +2180,7 @@ class TrainingSchedule:
         cd_start = int(self.scheduled_iterations * (1 - self.cooldown_frac))
         if step >= cd_start:
             t = min(1.0, (step - cd_start) / (self.scheduled_iterations - cd_start))
-            lr = lr * (1 - t) + 0.15 * t
+            lr = lr * (1 - t) + self.final_lr_mul * t
         return lr
 
 # window_sizes are in units of `block_size` tokens (defined in TrainingManager)
@@ -1894,11 +2196,33 @@ TRAINING_STAGES = [
                   mtp_weights_start=[1.0], mtp_weights_end=[1.0]),
 ]
 
+LR_COOLDOWN_FRAC = float(os.environ.get("LR_COOLDOWN_FRAC", "0.60"))
+LR_FINAL_MULT = float(os.environ.get("LR_FINAL_MULT", "0.15"))
+MUON_MOM_WARMUP_STEPS = int(os.environ.get("MUON_MOM_WARMUP_STEPS", "300"))
+MUON_MOM_COOLDOWN_STEPS = int(os.environ.get("MUON_MOM_COOLDOWN_STEPS", "50"))
+MUON_MOM_MIN = float(os.environ.get("MUON_MOM_MIN", "0.85"))
+MUON_MOM_MAX = float(os.environ.get("MUON_MOM_MAX", "0.95"))
+NORMUON_NOISE_SIGMA0 = float(os.environ.get("NORMUON_NOISE_SIGMA0", "0.0"))
+NORMUON_NOISE_END_FRAC = float(os.environ.get("NORMUON_NOISE_END_FRAC", "0.25"))
+NORMUON_NOISE_WARMUP = int(os.environ.get("NORMUON_NOISE_WARMUP", "50"))
+
 # TODO - Confirm.
-training_schedule = TrainingSchedule(TRAINING_STAGES, args.num_scheduled_iterations, args.num_extension_iterations, cooldown_frac=0.60)
+training_schedule = TrainingSchedule(
+    TRAINING_STAGES,
+    args.num_scheduled_iterations,
+    args.num_extension_iterations,
+    cooldown_frac=LR_COOLDOWN_FRAC,
+    final_lr_mul=LR_FINAL_MULT,
+)
 #training_schedule = TrainingSchedule(TRAINING_STAGES, args.num_scheduled_iterations, args.num_extension_iterations, cooldown_frac=0.55)
 
-def get_muon_momentum(step: int, muon_warmup_steps=300, muon_cooldown_steps=50, momentum_min=0.85, momentum_max=0.95):
+def get_muon_momentum(
+    step: int,
+    muon_warmup_steps=MUON_MOM_WARMUP_STEPS,
+    muon_cooldown_steps=MUON_MOM_COOLDOWN_STEPS,
+    momentum_min=MUON_MOM_MIN,
+    momentum_max=MUON_MOM_MAX,
+):
     # warmup phase: linearly increase momentum from min to max
     # cooldown phase: linearly decrease momentum from max to min
     momentum_cd_start = training_schedule.total_steps - muon_cooldown_steps
@@ -1911,6 +2235,18 @@ def get_muon_momentum(step: int, muon_warmup_steps=300, muon_cooldown_steps=50, 
     else:
         momentum = momentum_max
     return momentum
+
+def get_normuon_noise_scale(step: int) -> float:
+    if NORMUON_NOISE_SIGMA0 <= 0.0:
+        return 0.0
+    end_step = max(1, int(training_schedule.scheduled_iterations * NORMUON_NOISE_END_FRAC))
+    if step >= end_step:
+        return 0.0
+    sigma = NORMUON_NOISE_SIGMA0
+    if NORMUON_NOISE_WARMUP > 0 and step < NORMUON_NOISE_WARMUP:
+        sigma = sigma * (step / NORMUON_NOISE_WARMUP)
+    decay = max(0.0, (end_step - step) / end_step)
+    return sigma * decay
 
 class TrainingManager():
     """
@@ -1925,6 +2261,8 @@ class TrainingManager():
     def __init__(self, model):
         self.model = model
         self.block_size = 128
+        adam_coptim_scale = float(os.environ.get("ADAM_COPTIM_SCALE", "0.0"))
+        lm_head_lr_mul = float(os.environ.get("LM_HEAD_LR_MUL", "1.0"))
 
         # - Ordering dictates when to launch reduce/reduce_scatter operations
         # - "sharded" parameters use reduce_scatter/all_gather and "replicated" ones use all_reduce
@@ -1936,11 +2274,11 @@ class TrainingManager():
             "scalars":        {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},
             "smear_gate":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.01, "wd_mul": 0.0},
             "ve_gate_bank":   {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
-            "lm_head":        {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
-            "bigram_embed":   {"optim": "adam",    "comms": "sharded_sparse", "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
+            "lm_head":        {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "lr_mul": lm_head_lr_mul, "wd_mul": 150.},
+            "bigram_embed":   {"optim": "adam",    "comms": "sharded_sparse", "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0, "adam_coptim": 0.5 * adam_coptim_scale},
             "post_lambdas":   {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
             "resid_lambdas":  {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 5.0,  "wd_mul": 0.0},
-            "value_embeds":   {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
+            "value_embeds":   {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0, "adam_coptim": 0.5 * adam_coptim_scale},
             "embed":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
         }
 
@@ -2036,6 +2374,7 @@ class TrainingManager():
         step_lr = training_schedule.get_lr(step)
         muon_momentum = get_muon_momentum(step)
         do_adam = self._is_adam_step(step)
+        self.optimizer._normuon_noise_scale = get_normuon_noise_scale(step)
 
         # Update learning rates and momentum for all params
         for param, p_cfg in self.optimizer.param_cfgs.items():
@@ -2135,6 +2474,15 @@ def nvidia_smi():
 print0(nvidia_smi())
 print0("="*100)
 
+TRACK1_SEED = os.environ.get("TRACK1_SEED")
+if TRACK1_SEED is not None:
+    seed = int(TRACK1_SEED)
+    random.seed(seed)
+    np.random.seed(seed % (2**32))
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    print0(f"TRACK1_SEED set to {seed}", console=True)
+
 model: nn.Module = GPT(
     vocab_size=50257,
     num_layers=11,
@@ -2205,6 +2553,134 @@ del val_loader, train_loader, initial_state
 model.quantize_mlp_fp8()
 model.train()
 
+EMA_DECAY = float(os.environ.get("TRACK1_EMA_DECAY", "0.0"))
+EMA_START = int(os.environ.get("TRACK1_EMA_START", str(training_schedule.total_steps + 1)))
+EMA_EVERY = max(1, int(os.environ.get("TRACK1_EMA_EVERY", "16")))
+EMA_SCOPE = os.environ.get("TRACK1_EMA_SCOPE", "all")
+EMA_EVAL = env_flag("TRACK1_EMA_EVAL", "1")
+EMA_DTYPE = os.environ.get("TRACK1_EMA_DTYPE", "bf16")
+TRAIN_LOG_EVERY = max(1, int(os.environ.get("TRAIN_LOG_EVERY", "1")))
+EMA_REBASE_STEP = int(os.environ.get("TRACK1_EMA_REBASE_STEP", "-1"))
+EMA_REBASE_ADAM = os.environ.get("TRACK1_EMA_REBASE_ADAM", "keep")
+EMA_REBASE_ADAM_DAMP = float(os.environ.get("TRACK1_EMA_REBASE_ADAM_DAMP", "0.0"))
+EMA_REBASE_BLEND = float(os.environ.get("TRACK1_EMA_REBASE_BLEND", "1.0"))
+EMA_EXTRA = os.environ.get("TRACK1_EMA_EXTRA", "")
+
+class SparseParamEMA:
+    def __init__(self, module: nn.Module, decay: float, start: int, every: int, scope: str, dtype_name: str, label: str = "ema"):
+        self.module = module
+        self.label = label
+        self.decay = decay
+        self.start = start
+        self.every = every
+        self.scope = scope
+        self.dtype = torch.float32 if dtype_name == "fp32" else torch.bfloat16
+        self.params = self._collect_params()
+        self.shadow: list[Tensor] = []
+        self.backup: list[Tensor] = []
+        self.initialized = False
+        self.enabled = decay > 0.0 and len(self.params) > 0
+        if self.enabled and master_process:
+            names = ", ".join(name for name, _ in self.params[:6])
+            suffix = "" if len(self.params) <= 6 else f", ... ({len(self.params)} tensors)"
+            print0(f"TRACK1 EMA {label} enabled scope={scope} start={start} every={every} decay={decay} dtype={dtype_name}: {names}{suffix}", console=True)
+
+    def _include(self, name: str) -> bool:
+        name = name.removeprefix("_orig_mod.")
+        if self.scope == "all":
+            return True
+        if self.scope == "head":
+            return name.startswith("lm_head.")
+        if self.scope == "readout":
+            return name.startswith("lm_head.") or name.startswith("embed.")
+        if self.scope == "no_big_tables":
+            return not (
+                name.startswith("embed.")
+                or name.startswith("lm_head.")
+                or name.startswith("bigram_embed.")
+                or name.startswith("value_embeds")
+            )
+        return name.startswith(self.scope)
+
+    def _collect_params(self) -> list[tuple[str, nn.Parameter]]:
+        params = []
+        for name, param in self.module.named_parameters():
+            if param.requires_grad and param.is_floating_point() and self._include(name):
+                params.append((name.removeprefix("_orig_mod."), param))
+        return params
+
+    @torch.no_grad()
+    def maybe_update(self, step: int):
+        if not self.enabled or step < self.start or (step - self.start) % self.every != 0:
+            return
+        if not self.initialized:
+            self.shadow = [param.detach().to(dtype=self.dtype).clone() for _, param in self.params]
+            self.initialized = True
+            return
+        for shadow, (_, param) in zip(self.shadow, self.params):
+            shadow.mul_(self.decay).add_(param.detach().to(dtype=self.dtype), alpha=1.0 - self.decay)
+
+    @torch.no_grad()
+    def swap_to_ema(self) -> bool:
+        if not self.enabled or not self.initialized:
+            return False
+        self.backup = [param.detach().clone() for _, param in self.params]
+        for shadow, (_, param) in zip(self.shadow, self.params):
+            param.copy_(shadow.to(dtype=param.dtype))
+        return True
+
+    @torch.no_grad()
+    def restore(self):
+        if not self.backup:
+            return
+        for backup, (_, param) in zip(self.backup, self.params):
+            param.copy_(backup)
+        self.backup = []
+
+    @torch.no_grad()
+    def rebase(self, training_manager: "TrainingManager", adam_mode: str, adam_damp: float, blend: float) -> bool:
+        if not self.enabled or not self.initialized:
+            return False
+        for shadow, (_, param) in zip(self.shadow, self.params):
+            if blend >= 1.0:
+                param.copy_(shadow.to(dtype=param.dtype))
+            else:
+                param.lerp_(shadow.to(dtype=param.dtype), blend)
+            state = training_manager.optimizer.param_states.get(param)
+            if state is not None and "exp_avg" in state:
+                if adam_mode == "zero":
+                    state["exp_avg"].zero_()
+                    state["exp_avg_sq"].zero_()
+                elif adam_mode == "damp":
+                    state["exp_avg"].mul_(adam_damp)
+                    state["exp_avg_sq"].mul_(adam_damp)
+        return True
+
+def parse_extra_emas(config: str) -> list[tuple[str, float, int, int, str, str]]:
+    parsed = []
+    for item in config.split(";"):
+        item = item.strip()
+        if not item:
+            continue
+        parts = [part.strip() for part in item.split(",")]
+        if len(parts) not in (5, 6):
+            raise ValueError(
+                "TRACK1_EMA_EXTRA entries must be name,decay,start,every,scope[,dtype]; "
+                f"got {item!r}"
+            )
+        name, decay, start, every, scope = parts[:5]
+        dtype_name = parts[5] if len(parts) == 6 else EMA_DTYPE
+        parsed.append((name, float(decay), int(start), max(1, int(every)), scope, dtype_name))
+    return parsed
+
+ema_readout = SparseParamEMA(model, EMA_DECAY, EMA_START, EMA_EVERY, EMA_SCOPE, EMA_DTYPE)
+ema_readouts = [("ema", ema_readout)]
+for extra_name, extra_decay, extra_start, extra_every, extra_scope, extra_dtype in parse_extra_emas(EMA_EXTRA):
+    ema_readouts.append((
+        extra_name,
+        SparseParamEMA(model, extra_decay, extra_start, extra_every, extra_scope, extra_dtype, extra_name),
+    ))
+
 ########################################
 #        Training and validation       #
 ########################################
@@ -2216,10 +2692,27 @@ training_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
 t0 = time.perf_counter()
+
+def evaluate_val_loss() -> Tensor:
+    assert args.val_tokens % args.val_batch_size == 0
+    val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
+    val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
+    val_loss = torch.zeros((), device=device)
+    with torch.no_grad():
+        for _ in range(val_steps):
+            inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
+            val_loss += model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).mean()
+    val_loss /= val_steps
+    del val_loader
+    dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
+    return val_loss
+
 # begin training
 train_steps = training_schedule.total_steps
-for step in range(train_steps + 1):
-    last_step = (step == train_steps)
+stop_after_step = int(os.environ.get("STOP_AFTER_STEP", train_steps))
+run_steps = min(train_steps, stop_after_step)
+for step in range(run_steps + 1):
+    last_step = (step == run_steps)
     training_manager.advance_schedule(step)
     # --------------- VALIDATION SECTION -----------------
     if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
@@ -2229,18 +2722,17 @@ for step in range(train_steps + 1):
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
         model.eval()
-        assert args.val_tokens % args.val_batch_size == 0
-        val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
-        val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
-        val_loss = 0
-        with torch.no_grad():
-            for _ in range(val_steps):
-                inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
-                val_loss += model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).mean()
-        val_loss /= val_steps
-        del val_loader
-        dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
-        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        val_loss = evaluate_val_loss()
+        msg = f"step:{step}/{train_steps} val_loss:{val_loss:.5f}"
+        if EMA_EVAL:
+            for ema_name, ema in ema_readouts:
+                if ema.swap_to_ema():
+                    ema_val_loss = evaluate_val_loss()
+                    ema.restore()
+                    metric_name = "ema_val_loss" if ema_name == "ema" else f"{ema_name}_val_loss"
+                    msg += f" {metric_name}:{ema_val_loss:.5f}"
+        msg += f" train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms"
+        print0(msg, console=True)
         model.train()
         # start the clock again
         torch.cuda.synchronize()
@@ -2264,10 +2756,20 @@ for step in range(train_steps + 1):
         del loss
     training_manager.step_optimizers(step)
     model.quantize_mlp_fp8()
+    for _, ema in ema_readouts:
+        ema.maybe_update(step + 1)
+    if (step + 1) == EMA_REBASE_STEP:
+        rebased = ema_readout.rebase(training_manager, EMA_REBASE_ADAM, EMA_REBASE_ADAM_DAMP, EMA_REBASE_BLEND)
+        if rebased:
+            print0(
+                f"TRACK1 EMA rebase applied at step {step + 1}: blend={EMA_REBASE_BLEND} adam={EMA_REBASE_ADAM} damp={EMA_REBASE_ADAM_DAMP}",
+                console=True,
+            )
 
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+    if (step + 1) <= 5 or (step + 1) % TRAIN_LOG_EVERY == 0:
+        print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
 
 if args.run_evals:
     model.eval()
