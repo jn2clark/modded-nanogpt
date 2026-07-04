@@ -90,3 +90,9 @@ Direct retune/extension of PR #331 (@didiforgithub) and PR #328 (@ypwang61), whi
 Tail-EMA eval readout from PR #325 (this account) and the SOAP-Muon clean base of PR #321
 (@ypwang61). The heat-ramp observation extends #325's finding that weight-averaging makes tail
 temperature nearly free.
+
+## Corroboration (seed 8)
+
+A ninth official run (seed 8) gives `val_loss(2650) = 3.27946`; the statistic also passes at n = 9:
+`mean = 3.278638, (3.28 - mean) * sqrt(9) = 0.00409 >= 0.004`. The n = 8 (seeds 0-7) result above is
+the formal claim.
