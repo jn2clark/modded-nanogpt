@@ -15,7 +15,7 @@ This is a 15-step improvement over the open 2660-step result in PR #331.
 The optimizer stack from PR #331 is retained. Four late-training changes are
 added:
 
-1. Retard the schedule clock by up to 180 steps between steps 2250 and 2645:
+1. Delay the schedule clock by up to 180 steps between steps 2250 and 2645:
 
    $$t_s = t - 180\,\operatorname{clip}\left(\frac{t-2250}{2645-2250},0,1\right).$$
 
