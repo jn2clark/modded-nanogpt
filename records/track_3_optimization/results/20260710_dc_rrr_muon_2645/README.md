@@ -19,7 +19,7 @@ added.
 steps 2250 and 2645:
 
 ```math
-t_s = t - 180\,\operatorname{clip}\left(\frac{t-2250}{2645-2250},0,1\right)
+t_s = t - 180\min\left(1,\max\left(0,\frac{t-2250}{2645-2250}\right)\right)
 ```
 
 **2. Tail-EMA initialization and update.** Initialize from optimizer velocity
