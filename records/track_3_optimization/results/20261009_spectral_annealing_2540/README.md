@@ -21,20 +21,23 @@ Per-seed results are in `summary.tsv`. Raw logs are `GH200_seed0.txt` through
 five-step validation grid from step 2500 through 2600. All 14 runs are included.
 The remaining 2 seeds from the original 16-seed queue are follow-up validation.
 
-At the same step as [PR #341](https://github.com/KellerJordan/modded-nanogpt/pull/341)
-(2600), the mean is `3.27529714` versus `3.27877000` (n=12), giving:
+Against the previous submitted result,
+[2580 steps in PR #377](https://github.com/KellerJordan/modded-nanogpt/pull/377),
+the means at the same step (2600) are `3.27529714` for this result
+and `3.27778313` for PR #377 (n=16), giving:
 
-`(3.27877000 - 3.27529714) / sqrt(1/12 + 1/14) = 0.00882785`
+`(3.27778313 - 3.27529714) / sqrt(1/16 + 1/14) = 0.00679300`
 
-This exceeds the pairwise threshold of `0.004`.
-Against the preceding [2560-step submission](https://github.com/jn2clark/modded-nanogpt/tree/track3-headsoap-anchor-2560/records/track_3_optimization/results/20261005_headsoap_anchor_2560),
-the mean at step 2600 is `3.27639000` (n=12), giving a pairwise score of
-`0.00277799`. This comparison is not pairwise significant.
+The score is computed from the unrounded means and
+exceeds the pairwise threshold of `0.004`.
 
 ## Method
 
-The trainer adds spectral annealing to the 2560-step head eigen-Adam,
-anchor-extrapolated gradient and fp32 master embedding setup.
+The trainer builds on the 2580-step anchor-extrapolated gradient and fp32
+master embedding setup in PR #377. This submission adds spectral annealing
+and head eigen-Adam, disables the attention output projection trust gate from
+step 1000, and moves the fp32 embedding switch from the start of training to
+step 1000. The inherited anchor and readout are also described below.
 
 **Spectral annealing.** After the hidden-matrix Newton–Schulz update `U`, rotate
 into the SOAP row and column eigenbases `Qr` and `Qc`. Maintain slow gradient
@@ -54,23 +57,35 @@ starts when the LR first falls below its maximum, at step 514; the slow
 covariances are initialized from that step's gradient. The submitted run uses
 this original start time throughout.
 
-**Head eigen-Adam (one-sided SOAP).** From step 1000, the output head uses Adam
-in the eigenbasis of the EMA(0.95) of its gradient's right covariance. The basis
-is refreshed every eight steps and the Adam moments are rotated with it. This
-replaces the output-KFAC mix and the head's diagonal Adam.
+**Head eigen-Adam (one-sided SOAP).** From step 1000, replace the output-KFAC
+gradient mix and the head's diagonal Adam with Adam in a learned eigenbasis.
+For the head gradient `G` with `V` vocabulary rows, maintain the 768-by-768
+right covariance:
+
+`C = EMA_0.95(G.T @ G / V)`
+
+Compute its eigenbasis `Q` every eight steps. Adam updates its first and second
+moments using `G @ Q`, then maps the update back with `Q.T`. At each basis
+refresh, let `R = Q_old.T @ Q_new`; rotate the first moment with `m @ R` and
+the diagonal second moment with `v @ (R * R)`. The switch initializes these
+moments and the step counter from the head's existing Adam state.
 
 **Plain SOAP for attn.proj.** The attention output projection trust gate is used
-before step 1000. After that, it uses plain SOAP like the other matrices.
+before step 1000. This submission disables it from step 1000 onward, so the
+projection uses plain SOAP like the other hidden matrices.
+
+**Delayed fp32 master embedding.** PR #377 used an fp32 embedding master from
+the start of training. This submission keeps the original bf16 Adam updates
+until step 1000, then initializes an fp32 master copy and promotes the existing
+Adam moments to fp32 while retaining the step counter. Subsequent updates are
+accumulated in the master and rounded to bf16 for the forward pass. The
+embedding remains included in the anchor with readout blend zero.
+Architecture, forward dtype, data and batch size are unchanged.
 
 **Anchor-extrapolated gradient.** Let `e` be the Tail-EMA of the weights
 (`e = e + (w - e) / 100`, from step 2040). From step 2100, the single
 forward-backward pass is evaluated at `y = w + g_t * (w - e)`, with `g_t`
 ramping from `0` to `0.45` by step 2200. The resulting gradient updates `w`.
-
-**fp32 master embedding.** From step 1000, the embedding optimizer maintains
-an fp32 master copy and fp32 Adam state, then writes the bf16-rounded master
-to the parameter. The embedding is included in the anchor with readout blend
-zero. Architecture, forward dtype, data and batch size are unchanged.
 
 **Readout.** Tail-EMA `tau` is `100`. Fixed blends are `0.80` for first-block
 matrices, `0.55` for other block matrices, `1.00` for auxiliary parameters,
